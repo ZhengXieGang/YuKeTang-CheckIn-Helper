@@ -30,7 +30,7 @@ class YuketangHelper:
         cookies = self.session.cookies.get_dict()
         with open("yuketang_session.json", "w") as f:
             json.dump(cookies, f)
-        print("[*] 登录凭证已持久化保存至 yuketang_session.json，下次运行免扫码！")
+        print("[*] 登录凭证已保存至 yuketang_session.json！")
 
     def load_session(self):
         try:
