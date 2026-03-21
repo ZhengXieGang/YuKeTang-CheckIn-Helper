@@ -229,7 +229,36 @@ class YuketangHelper:
         except Exception as e:
             print(f"[ERROR] 异常: {e}")
 
+    def keep_alive(self):
+        """定期访问核心接口以重置 Session 的过期时间"""
+        # 改用我们确信结构稳定的课堂巡检接口作为底层心跳包
+        url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
+        try:
+            self.session.headers.update({"X-CSRFToken": self.csrftoken})
+            resp = self.session.get(url)
+            data = resp.json()
+            
+            # 如果服务端正常返回 JSON 格式且状态码验证身份为有效（code=0 或 success状态）
+            if isinstance(data, dict) and (data.get("code") == 0 or data.get("success") == True):
+                print("[+] 账户保活成功：当前状态已向雨课堂云端重置 (Keep-Alive)。")
+                self.save_session()
+                return True
+            else:
+                print("[-] 保活状态效验异常，Session 可能已过期。")
+                return False
+        except Exception as e:
+            print(f"[!] 保活心跳包请求异常: {e}")
+            return False
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="雨课堂(Yuketang) 一键自动签到脚本")
+    parser.add_argument("-a", "--auto", action="store_true", help="一键全自动：搜索活跃课程并签到")
+    parser.add_argument("-l", "--lesson", type=str, help="指定目标 Lesson ID 进行签到")
+    parser.add_argument("-s", "--source", type=int, default=1, help="指定模拟签到的 Source 参数 (默认: 1)")
+    parser.add_argument("-k", "--keepalive", action="store_true", help="单次保活模式：刷新凭证有效期后退出")
+    args = parser.parse_args()
+
     helper = YuketangHelper()
     
     # 首先尝试热加载本地凭证
@@ -242,6 +271,27 @@ if __name__ == "__main__":
             logged_in = True
             
     if logged_in:
+        # 如果带有命令行一键打卡参数，则执行后直接退出，作为定时任务的无头模式
+        if args.keepalive:
+            print("[*] CLI模式: 正在执行保活...")
+            helper.keep_alive()
+            sys.exit(0)
+
+        if args.auto:
+            l_id, c_id = helper.get_active_lesson_data()
+            if l_id:
+                print(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行抢签...")
+                helper.sign_in(l_id, classroom_id=c_id, source=args.source)
+            else:
+                print("[-] 自动巡检未发现正在进行的课堂。")
+            sys.exit(0)
+            
+        if args.lesson:
+            print(f"[*] CLI模式: 正在强制进入指定课程 {args.lesson}，source={args.source}...")
+            helper.sign_in(args.lesson, classroom_id=None, source=args.source)
+            sys.exit(0)
+
+        # 没有传递参数时，退回原来的交互菜单
         print("\n[V] 登录会话已就绪！您现在可以反复尝试签到功能，不必重新扫码。")
         while True:
             print("\n" + "-"*50)
