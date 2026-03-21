@@ -280,7 +280,7 @@ if __name__ == "__main__":
         if args.auto:
             l_id, c_id = helper.get_active_lesson_data()
             if l_id:
-                print(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行抢签...")
+                print(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行签到...")
                 helper.sign_in(l_id, classroom_id=c_id, source=args.source)
             else:
                 print("[-] 自动巡检未发现正在进行的课堂。")
