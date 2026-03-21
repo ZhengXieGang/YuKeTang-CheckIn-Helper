@@ -28,13 +28,15 @@ class YuketangHelper:
 
     def save_session(self):
         cookies = self.session.cookies.get_dict()
-        with open("yuketang_session.json", "w") as f:
+        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
+        with open(session_file, "w") as f:
             json.dump(cookies, f)
-        print("[*] 登录凭证已保存至 yuketang_session.json！")
+        print(f"[*] 登录凭证已保存至 {session_file}！")
 
     def load_session(self):
+        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
         try:
-            with open("yuketang_session.json", "r") as f:
+            with open(session_file, "r") as f:
                 cookies = json.load(f)
                 self.session.cookies.update(cookies)
                 self.sessionid = cookies.get('sessionid')
@@ -42,10 +44,26 @@ class YuketangHelper:
                     self.csrftoken = cookies['csrftoken']
             
             if self.sessionid:
-                print(f"[+] 成功从本地加载上一次的有效 sessionid！")
-                return True
+                print(f"[*] 读取到本地凭证 ({session_file})，正在向云端校验存活状态...")
+                url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
+                self.session.headers.update({"X-CSRFToken": self.csrftoken})
+                resp = self.session.get(url, timeout=10)
+                data = resp.json()
+                
+                # 校验：返回正规接口结构且属于登录状态
+                if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
+                    print("[+] 凭证效验通过，成功恢复免扫码状态！")
+                    return True
+                else:
+                    print("[-] 本地凭证在服务器端已失效或被顶号，需要重新扫码登录。")
+                    self.sessionid = None
+                    return False
             return False
-        except Exception:
+        except FileNotFoundError:
+            # 静默处理首次运行
+            return False
+        except Exception as e:
+            print(f"[-] 读取或校验凭证时发生致命错误: {e}")
             return False
 
     def _get_wechat_uuid(self, login_url):
@@ -314,7 +332,7 @@ if __name__ == "__main__":
                     l_id, c_id = helper.get_active_lesson_data()
                     if l_id:
                         print("\n[Source 参数指引] \n 1 扫二维码 (默认)\n 6 课堂暗号\n 9 小程序分享\n 2-5/其他 “正在上课”提示")
-                        req_source = input("\n👉 请输入要使用的 source 值 [默认 1]: ").strip()
+                        req_source = input("\n请输入要使用的 source 值 [默认 1]: ").strip()
                         req_source = int(req_source) if req_source.isdigit() else 1
                         print(f"[*] 发现课程 {l_id}，正在尝试使用 source={req_source} 签到...")
                         helper.sign_in(l_id, classroom_id=c_id, source=req_source)
