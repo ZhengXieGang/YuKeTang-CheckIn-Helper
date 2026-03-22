@@ -5,6 +5,11 @@ import json
 import sys
 import os
 import re
+from datetime import datetime
+
+def log(msg):
+    """带时间戳的全局日志输出"""
+    print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}")
 
 # 雨课堂基础配置 - 伪装为微信UA(好像没什么必要，但还是加上了)
 # 请在此修改你的核心学校版雨课堂域名
@@ -31,7 +36,7 @@ class YuketangHelper:
         session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
         with open(session_file, "w") as f:
             json.dump(cookies, f)
-        print(f"[*] 登录凭证已保存至 {session_file}！")
+        log(f"[*] 登录凭证已保存至 {session_file}！")
 
     def load_session(self):
         session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
@@ -44,7 +49,7 @@ class YuketangHelper:
                     self.csrftoken = cookies['csrftoken']
             
             if self.sessionid:
-                print(f"[*] 读取到本地凭证 ({session_file})，正在向云端校验存活状态...")
+                log(f"[*] 读取到本地凭证 ({session_file})，正在向云端校验存活状态...")
                 url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
                 self.session.headers.update({"X-CSRFToken": self.csrftoken})
                 resp = self.session.get(url, timeout=10)
@@ -52,10 +57,10 @@ class YuketangHelper:
                 
                 # 校验：返回正规接口结构且属于登录状态
                 if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
-                    print("[+] 凭证效验通过，成功恢复免扫码状态！")
+                    log("[+] 凭证效验通过，成功恢复免扫码状态！")
                     return True
                 else:
-                    print("[-] 本地凭证在服务器端已失效或被顶号，需要重新扫码登录。")
+                    log("[-] 本地凭证在服务器端已失效或被顶号，需要重新扫码登录。")
                     self.sessionid = None
                     return False
             return False
@@ -63,7 +68,7 @@ class YuketangHelper:
             # 静默处理首次运行
             return False
         except Exception as e:
-            print(f"[-] 读取或校验凭证时发生致命错误: {e}")
+            log(f"[-] 读取或校验凭证时发生致命错误: {e}")
             return False
 
     def _get_wechat_uuid(self, login_url):
@@ -77,12 +82,12 @@ class YuketangHelper:
             else:
                 return None
         except Exception as e:
-            print(f"[!] 提取微信 UUID 出错: {e}")
+            log(f"[!] 提取微信 UUID 出错: {e}")
             return None
 
     def get_login_qrcode(self):
         """步骤 1: 向雨课堂申请扫码登录参数并显示二维码"""
-        print("[*] 正在向雨课堂申请登录授权参数...")
+        log("[*] 正在向雨课堂申请登录授权参数...")
         url = f"{BASE_URL}/api/v3/user/login/wechat-auth-param"
         try:
             resp = self.session.post(url, json={})
@@ -90,7 +95,7 @@ class YuketangHelper:
             
             data = resp.json()
             if data['code'] != 0:
-                print(f"[!] 获取授权参数失败: {data['msg']}")
+                log(f"[!] 获取授权参数失败: {data['msg']}")
                 return None, None
             
             auth_data = data['data']
@@ -100,18 +105,18 @@ class YuketangHelper:
             
             login_url = f"https://open.weixin.qq.com/connect/qrconnect?appid={app_id}&redirect_uri={redirect_uri}&response_type=code&scope=snsapi_login&state={state}"
             
-            print("[*] 正在解析原生微信登录凭证...")
+            log("[*] 正在解析原生微信登录凭证...")
             uuid = self._get_wechat_uuid(login_url)
             
             if not uuid:
-                print("[!] 无法获取 UUID，尝试使用降级方案显示二维码。")
+                log("[!] 无法获取 UUID，尝试使用降级方案显示二维码。")
                 final_qr_content = login_url + "#wechat_redirect"
                 return state, None
             
             # 使用原生的确认登录协议渲染二维码
             final_qr_content = f"https://open.weixin.qq.com/connect/confirm?uuid={uuid}"
             print("\n" + "="*50)
-            print("[*] 请使用微信扫描下方二维码进行登录确认：")
+            log("[*] 请使用微信扫描下方二维码进行登录确认：")
             qr = qrcode.QRCode()
             qr.add_data(final_qr_content)
             qr.make(fit=True)
@@ -120,17 +125,17 @@ class YuketangHelper:
             
             return state, uuid
         except Exception as e:
-            print(f"[!] 获取二维码失败 (错误: {e})")
+            log(f"[!] 获取二维码失败 (错误: {e})")
             return None, None
 
     def wait_for_login_and_callback(self, state, uuid):
         """核心重构: 轮询微信官方接口获取 code, 并访问雨课堂回调接口完成登录"""
         if not uuid:
-            print("[!] 缺少 UUID，无法在后台追踪扫码状态。")
+            log("[!] 缺少 UUID，无法在后台追踪扫码状态。")
             return False
             
         # 1. 轮询微信接口获取授权 code
-        print("[*] 正在轮询微信状态，等待手机确认...")
+        log("[*] 正在轮询微信状态，等待手机确认...")
         poll_url = f"https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={int(time.time()*1000)}"
         
         while True:
@@ -149,14 +154,14 @@ class YuketangHelper:
                     code_match = re.search(r"window.wx_code='([^']+)'", content)
                     if code_match:
                         auth_code = code_match.group(1)
-                        print(f"[+] 微信授权成功，获得临时票据。")
+                        log("[+] 微信授权成功，获得临时票据。")
                         return self._finalize_login(auth_code, state)
                 elif errcode == 408: # 超时继续轮询
                     pass
                 elif errcode == 404: # 已扫码待确认
-                    print("[*] 扫码成功，请在手机上点击确认...")
+                    log("[*] 扫码成功，请在手机上点击确认...")
                 elif errcode == 403: # 二维码真正的失效状态码通常是 403 或其他
-                    print("[!] 二维码可能已失效，请重新运行脚本。")
+                    log("[!] 二维码可能已失效，请重新运行脚本。")
                     return False
                 
                 # 更新时间戳以防缓存
@@ -165,12 +170,12 @@ class YuketangHelper:
             except KeyboardInterrupt:
                 return False
             except Exception as e:
-                print(f"[!] 轮询微信接口异常: {e}")
+                log(f"[!] 轮询微信接口异常: {e}")
                 time.sleep(5)
 
     def _finalize_login(self, code, state):
         """步骤 3: 访问雨课堂回调接口，将微信凭证兑换为 sessionid"""
-        print("[*] 正在进行雨课堂最终握手登录...")
+        log("[*] 正在进行雨课堂最终握手登录...")
         callback_url = f"{BASE_URL}/api/v3/user/login/wechat-web-callback"
         params = {"code": code, "state": state}
         
@@ -184,22 +189,22 @@ class YuketangHelper:
             self.csrftoken = cookies_dict.get('csrftoken') or self.csrftoken
             
             if self.sessionid:
-                print("[+] 登录全流程完成！已成功捕获凭据。")
+                log("[+] 登录全流程完成！已成功捕获凭据。")
                 self.save_session()
                 return True
             else:
-                print(f"[!] 登录失败，服务器未返回 sessionid。")
-                print(f"|--- HTTP 状态码: {resp.status_code}")
-                print(f"|--- 截获的 Cookie: {cookies_dict}")
-                print(f"|--- Response Headers: {resp.headers}")
+                log(f"[!] 登录失败，服务器未返回 sessionid。")
+                log(f"|--- HTTP 状态码: {resp.status_code}")
+                log(f"|--- 截获的 Cookie: {cookies_dict}")
+                log(f"|--- Response Headers: {resp.headers}")
                 return False
         except Exception as e:
-            print(f"[!] 最终登录环节出错: {e}")
+            log(f"[!] 最终登录环节出错: {e}")
             return False
 
     def get_active_lesson_data(self):
         """步骤 4: 自动发现活跃课堂"""
-        print("[*] 正在自动检索当前正在进行的课堂...")
+        log("[*] 正在自动检索当前正在进行的课堂...")
         url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
         try:
             self.session.headers.update({"X-CSRFToken": self.csrftoken})
@@ -207,12 +212,12 @@ class YuketangHelper:
             data = resp.json()
             active_list = data.get('data', {}).get('onLessonClassrooms', [])
             if not active_list:
-                print("[-] 目前没有检测到正在进行的课堂。")
+                log("[-] 目前没有检测到正在进行的课堂。")
                 return None, None
             found = active_list[0]
             return found.get('lessonId'), found.get('classroomId')
         except Exception as e:
-            print(f"[!] 获取课堂列表失败: {e}")
+            log(f"[!] 获取课堂列表失败: {e}")
             return None, None
 
     def sign_in(self, lesson_id, classroom_id=None, source=1):
@@ -236,16 +241,16 @@ class YuketangHelper:
         if classroom_id:
             headers["Referer"] = f"{BASE_URL}/v2/web/studentLog/{classroom_id}"
         
-        print(f"[*] 正在伪装微信提交签到 (Lesson: {lesson_id})...")
+        log(f"[*] 正在伪装微信提交签到 (Lesson: {lesson_id})...")
         try:
             resp = self.session.post(url, headers=headers, json=payload)
             result = resp.json()
             if result.get('code') == 0:
-                print(f"[SUCCESS] 签到完成: {result.get('msg')}")
+                log(f"[SUCCESS] 签到完成: {result.get('msg')}")
             else:
-                print(f"[FAILED] 失败: {result.get('msg')}")
+                log(f"[FAILED] 失败: {result.get('msg')}")
         except Exception as e:
-            print(f"[ERROR] 异常: {e}")
+            log(f"[ERROR] 异常: {e}")
 
     def keep_alive(self):
         """定期访问核心接口以重置 Session 的过期时间"""
@@ -258,14 +263,14 @@ class YuketangHelper:
             
             # 如果服务端正常返回 JSON 格式且状态码验证身份为有效（code=0 或 success状态）
             if isinstance(data, dict) and (data.get("code") == 0 or data.get("success") == True):
-                print("[+] 账户保活成功：当前状态已向雨课堂云端重置 (Keep-Alive)。")
+                log("[+] 账户保活成功：当前状态已向雨课堂云端重置 (Keep-Alive)。")
                 self.save_session()
                 return True
             else:
-                print("[-] 保活状态效验异常，Session 可能已过期。")
+                log("[-] 保活状态效验异常，Session 可能已过期。")
                 return False
         except Exception as e:
-            print(f"[!] 保活心跳包请求异常: {e}")
+            log(f"[!] 保活心跳包请求异常: {e}")
             return False
 
 if __name__ == "__main__":
@@ -291,26 +296,26 @@ if __name__ == "__main__":
     if logged_in:
         # 如果带有命令行一键打卡参数，则执行后直接退出，作为定时任务的无头模式
         if args.keepalive:
-            print("[*] CLI模式: 正在执行保活...")
+            log("[*] CLI模式: 正在执行保活...")
             helper.keep_alive()
             sys.exit(0)
 
         if args.auto:
             l_id, c_id = helper.get_active_lesson_data()
             if l_id:
-                print(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行签到...")
+                log(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行签到...")
                 helper.sign_in(l_id, classroom_id=c_id, source=args.source)
             else:
-                print("[-] 自动巡检未发现正在进行的课堂。")
+                log("[-] 自动巡检未发现正在进行的课堂。")
             sys.exit(0)
             
         if args.lesson:
-            print(f"[*] CLI模式: 正在强制进入指定课程 {args.lesson}，source={args.source}...")
+            log(f"[*] CLI模式: 正在强制进入指定课程 {args.lesson}，source={args.source}...")
             helper.sign_in(args.lesson, classroom_id=None, source=args.source)
             sys.exit(0)
 
         # 没有传递参数时，退回原来的交互菜单
-        print("\n[V] 登录会话已就绪！您现在可以反复尝试签到功能，不必重新扫码。")
+        log("\n[V] 登录会话已就绪！您现在可以反复尝试签到功能，不必重新扫码。")
         while True:
             print("\n" + "-"*50)
             print("【雨课堂辅助菜单】")
@@ -324,20 +329,20 @@ if __name__ == "__main__":
                 if choice == "1":
                     l_id, c_id = helper.get_active_lesson_data()
                     if l_id:
-                        print(f"[*] 发现课程 {l_id}，正在以微信服务号形式 (source=1) 尝试签到...")
+                        log(f"[*] 发现课程 {l_id}，正在以微信服务号形式 (source=1) 尝试签到...")
                         helper.sign_in(l_id, classroom_id=c_id, source=1)
                     else:
-                        print("[-] 没有发现活跃课堂，请检查当前是否有课。")
+                        log("[-] 没有发现活跃课堂，请检查当前是否有课。")
                 elif choice == "2":
                     l_id, c_id = helper.get_active_lesson_data()
                     if l_id:
                         print("\n[Source 参数指引] \n 1 扫二维码 (默认)\n 6 课堂暗号\n 9 小程序分享\n 2-5/其他 “正在上课”提示")
                         req_source = input("\n请输入要使用的 source 值 [默认 1]: ").strip()
                         req_source = int(req_source) if req_source.isdigit() else 1
-                        print(f"[*] 发现课程 {l_id}，正在尝试使用 source={req_source} 签到...")
+                        log(f"[*] 发现课程 {l_id}，正在尝试使用 source={req_source} 签到...")
                         helper.sign_in(l_id, classroom_id=c_id, source=req_source)
                     else:
-                        print("[-] 没有发现活跃课堂，请检查当前是否有课。")
+                        log("[-] 没有发现活跃课堂，请检查当前是否有课。")
                 elif choice == "3":
                     target_id = input("请输入目标 Lesson ID: ").strip()
                     if target_id:
@@ -346,13 +351,13 @@ if __name__ == "__main__":
                         req_source = int(req_source) if req_source.isdigit() else 1
                         helper.sign_in(target_id, classroom_id=None, source=req_source)
                 elif choice == "4":
-                    print("[*] 结束退出。您的本地登录凭证仍在有效期内！下次启动可免扫码。")
+                    log("[*] 结束退出。您的本地登录凭证仍在有效期内！下次启动可免扫码。")
                     sys.exit(0)
                 else:
                     print("[!] 无效的选择，请重新输入。")
             except KeyboardInterrupt:
-                print("\n[*] 监测到终端退出指令")
+                log("监测到终端退出指令")
                 sys.exit(0)
             except Exception as e:
                 # 捕获未知异常，防止死循环崩盘
-                print(f"[!] 发生意外错误，但已阻止强制退出: {e}")
+                log(f"[!] 发生意外错误，但已阻止强制退出: {e}")
