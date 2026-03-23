@@ -49,23 +49,32 @@ class YuketangHelper:
                     self.csrftoken = cookies['csrftoken']
             
             if self.sessionid:
-                log(f"[*] 读取到本地凭证 ({session_file})，正在向云端校验存活状态...")
+                log(f"[*] 读取到本地凭证，正在向云端发起全深度校验及保活唤醒...")
+                # 优化保活1：先请求一次前端主页，这是能100%触发后端 Django Session 更新机制和刷新 Token 的行为
+                self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
+                
                 url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
                 self.session.headers.update({"X-CSRFToken": self.csrftoken})
                 resp = self.session.get(url, timeout=10)
-                data = resp.json()
                 
-                # 校验：返回正规接口结构且属于登录状态
+                # 遇到掉线，雨课堂往往不返回 JSON 而是 302 到登录或者返回 HTML
+                if "application/json" not in resp.headers.get("Content-Type", ""):
+                    log("[-] 本地凭证校验遭到拦截 (接口返回非JSON) ，判断为 Session 已过期。")
+                    self.sessionid = None
+                    return False
+                    
+                data = resp.json()
                 if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
                     log("[+] 凭证效验通过，成功恢复免扫码状态！")
+                    # 校验成功后顺手固化一下可能被更替的新 Cookie
+                    self.save_session()
                     return True
                 else:
-                    log("[-] 本地凭证在服务器端已失效或被顶号，需要重新扫码登录。")
+                    log("[-] 凭证请求未授权，Session 已失效或被异地顶号，需重新扫码。")
                     self.sessionid = None
                     return False
             return False
         except FileNotFoundError:
-            # 静默处理首次运行
             return False
         except Exception as e:
             log(f"[-] 读取或校验凭证时发生致命错误: {e}")
@@ -180,8 +189,8 @@ class YuketangHelper:
         params = {"code": code, "state": state}
         
         try:
-            # 访问回调接口（禁止自动跳转，拦截真实的 302 回调指令防 Cookie 蒸发）
-            resp = self.session.get(callback_url, params=params, allow_redirects=False)
+            # 优化：允许自动跳转，放任服务器进行完整的登录链路重定向，以彻底派发所有持久化 Cookie
+            resp = self.session.get(callback_url, params=params, allow_redirects=True)
             
             # 使用全局 Session 获取最新 Cookie
             cookies_dict = self.session.cookies.get_dict()
@@ -253,21 +262,26 @@ class YuketangHelper:
             log(f"[ERROR] 异常: {e}")
 
     def keep_alive(self):
-        """定期访问核心接口以重置 Session 的过期时间"""
-        # 改用我们确信结构稳定的课堂巡检接口作为底层心跳包
-        url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
+        """完全模拟浏览器开启主页并查阅列表的深度保活机制"""
         try:
-            self.session.headers.update({"X-CSRFToken": self.csrftoken})
-            resp = self.session.get(url)
-            data = resp.json()
+            # 深度唤醒：强制拉取前端 HTML 页面触发最强刷新
+            self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
             
-            # 如果服务端正常返回 JSON 格式且状态码验证身份为有效（code=0 或 success状态）
+            url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
+            self.session.headers.update({"X-CSRFToken": self.csrftoken})
+            resp = self.session.get(url, timeout=10)
+            
+            if "application/json" not in resp.headers.get("Content-Type", ""):
+                log("[-] 保活校验异常：服务器无视了请求并引发了拦截，Session 已死亡。")
+                return False
+
+            data = resp.json()
             if isinstance(data, dict) and (data.get("code") == 0 or data.get("success") == True):
-                log("[+] 账户保活成功：当前状态已向雨课堂云端重置 (Keep-Alive)。")
+                log("[+] 深度保活包提交成功：当前会话寿命已被重置 (Keep-Alive)。")
                 self.save_session()
                 return True
             else:
-                log("[-] 保活状态效验异常，Session 可能已过期。")
+                log("[-] 保活状态效验异常，Session 可能已被踢出。")
                 return False
         except Exception as e:
             log(f"[!] 保活心跳包请求异常: {e}")
