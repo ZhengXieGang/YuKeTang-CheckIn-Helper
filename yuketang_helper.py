@@ -5,373 +5,456 @@ import json
 import sys
 import os
 import re
+import asyncio
+import argparse
 from datetime import datetime
 
+# 检测可选依赖是否可用
+try:
+    import ddddocr
+    from PIL import Image
+    from io import BytesIO
+    from playwright.async_api import async_playwright
+    HAS_AUTO_LOGIN = True
+except ImportError:
+    HAS_AUTO_LOGIN = False
+
+# ========== 用户配置 ==========
+AUTO_LOGIN_PHONE = "[ACCOUNT]"
+AUTO_LOGIN_PSWD = "[PASSWORD]"
+CHECKIN_COOLDOWN_MINUTES = 30
+# ==============================
+
+GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+BASE_URL = "https://changjiang.yuketang.cn"
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
+
 def log(msg):
-    """带时间戳的全局日志输出"""
     print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}")
 
-# 雨课堂基础配置 - 伪装为微信UA(好像没什么必要，但还是加上了)
-# 请在此修改你的核心学校版雨课堂域名
-BASE_URL = "https://changjiang.yuketang.cn"  
-WECHAT_UA = "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Mobile Safari/537.36 MMWEBID/1602 MicroMessenger/8.0.30(0x28001E55) Process/tools NetType/WIFI Language/zh_CN ABI/arm64"
 
-HEADERS = {
-    "User-Agent": WECHAT_UA,
-    "xtbz": "ykt",
-    "Referer": f"{BASE_URL}/v2/web/index",
-    "Content-Type": "application/json"
-}
+# ==================== 自动登录模块（内联） ====================
+
+class AutoLogin:
+    """基于 Playwright + ddddocr 的全自动账密登录，含验证码破解"""
+
+    def __init__(self, phone, password):
+        self.phone = phone
+        self.password = password
+        self.ocr = ddddocr.DdddOcr(show_ad=False)
+        self.det = ddddocr.DdddOcr(det=True, show_ad=False)
+        self.slider_ocr = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
+
+    def _select_spots(self, char_map, instruction, attempt):
+        """坐标排序：语义占位 + 地理回填"""
+        try:
+            target = re.sub(r"请依次点击|:|：|\"|'| ", "", instruction)
+            # 物理去重
+            clean = []
+            for item in char_map:
+                if not any(((item['x']-e['x'])**2 + (item['y']-e['y'])**2)**0.5 < 25 for e in clean):
+                    clean.append(item)
+            # 语义占位
+            spots = [None] * len(target)
+            used = set()
+            for i, ch in enumerate(target):
+                for item in clean:
+                    if id(item) not in used and (ch in item['char'] or item['char'] in ch):
+                        spots[i] = item; used.add(id(item)); break
+            # 地理回填
+            avail = [x for x in clean if id(x) not in used]
+            s = attempt % 4
+            if s == 0: avail.sort(key=lambda x: x['x'])
+            elif s == 1: avail.sort(key=lambda x: x['x'], reverse=True)
+            elif s == 2: avail.sort(key=lambda x: x['y'])
+            else: avail.sort(key=lambda x: x['x'] + x['y'])
+            ptr = 0
+            for i in range(len(spots)):
+                if spots[i] is None and ptr < len(avail):
+                    spots[i] = avail[ptr]; ptr += 1
+            return [x for x in spots if x is not None]
+        except:
+            return char_map[:3]
+
+    async def run(self):
+        """执行自动登录，成功则写入 session 文件并返回 True"""
+        log("[*] 正在启动自动化登录...")
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context(user_agent=GLOBAL_UA)
+            page = await ctx.new_page()
+
+            await page.goto(f"{BASE_URL}/v2/web/index")
+            await asyncio.sleep(2)
+            try:
+                await page.locator('img.changeImg, .login-type-img').first.click(timeout=3000)
+            except:
+                pass
+            await page.fill('input[name="loginname"]', self.phone)
+            await page.fill('input[type="password"]', self.password)
+            await page.locator('.submit-btn.login-btn').click()
+
+            ok = False
+            for attempt in range(15):
+                await asyncio.sleep(2.5)
+                if any(c['name'] == 'sessionid' for c in await ctx.cookies()):
+                    ok = True; break
+
+                frame = next((f for f in page.frames if 'turing.captcha' in f.url), None)
+                if not frame:
+                    continue
+
+                try:
+                    instr = ""
+                    for sel in ['#instructionText', '.tc-title-words', '.tc-instruction-text']:
+                        try:
+                            t = await frame.locator(sel).first.text_content(timeout=1000)
+                            if t: instr = t; break
+                        except:
+                            pass
+                    if not instr:
+                        await frame.evaluate("document.querySelector('#reload, .tc-action--refresh').click()")
+                        continue
+
+                    if '滑' in instr:
+                        await self._handle_slider(frame)
+                    elif '点击' in instr:
+                        await self._handle_click(frame, instr, attempt)
+
+                    await asyncio.sleep(1.5)
+                    if await frame.locator('#slideBg').is_visible():
+                        await frame.evaluate("document.querySelector('#reload, .tc-action--refresh').click()")
+                except:
+                    try:
+                        await frame.evaluate("document.querySelector('#reload, .tc-action--refresh').click()")
+                    except:
+                        pass
+
+            await asyncio.sleep(2)
+            cookies = await ctx.cookies()
+            await browser.close()
+
+            if ok and any(c['name'] == 'sessionid' for c in cookies):
+                with open(STATE_FILE, "w") as f:
+                    json.dump({"cookies": cookies}, f)
+                log("[+] 自动登录成功，Session 已保存")
+                return True
+            log("[-] 自动登录未能通过验证")
+            return False
+
+    async def _handle_slider(self, frame):
+        """处理滑块验证"""
+        s_bg = await frame.locator('#slideBg').get_attribute('style')
+        s_bk = await frame.locator('#slideBlock').get_attribute('style')
+        m_bg = re.search(r'url\("?(.+?)"?\)', s_bg.replace('&quot;', '"'))
+        m_bk = re.search(r'url\("?(.+?)"?\)', s_bk.replace('&quot;', '"'))
+        if m_bg and m_bk:
+            import urllib.request
+            def dl(u): return urllib.request.urlopen(urllib.request.Request(u if u.startswith('http') else 'https:'+u, headers={'User-Agent': 'Mozilla'})).read()
+            bg_b, bk_b = dl(m_bg.group(1)), dl(m_bk.group(1))
+            res = self.slider_ocr.slide_match(bk_b, bg_b, simple_target=True)
+            box = await frame.locator('#slideBg').bounding_box()
+            if box:
+                scale = box['width'] / Image.open(BytesIO(bg_b)).size[0]
+                btn = frame.locator('.tc-action--normal, #tcOperation').first
+                await btn.drag_to(btn, source_position={'x': 0, 'y': 0}, target_position={'x': res['target'][0]*scale, 'y': 0})
+
+    async def _handle_click(self, frame, instr, attempt):
+        """处理文字点选验证"""
+        s_bg = await frame.locator('#slideBg').get_attribute('style')
+        m = re.search(r'url\("?(.+?)"?\)', s_bg.replace('&quot;', '"'))
+        if not m:
+            return
+        import urllib.request
+        url = m.group(1) if m.group(1).startswith('http') else 'https:' + m.group(1)
+        bg_b = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla'})).read()
+        poses = self.det.detection(bg_b)
+        img = Image.open(BytesIO(bg_b))
+        w, h = img.size
+        chars = []
+        for p in poses:
+            if (p[2]-p[0])*(p[3]-p[1]) < 400:
+                continue
+            crop = img.crop(p); buf = BytesIO(); crop.save(buf, 'PNG')
+            ch = self.ocr.classification(buf.getvalue())
+            chars.append({"char": ch, "x": (p[0]+p[2])/2, "y": (p[1]+p[3])/2})
+        elem = frame.locator('#slideBg')
+        box = await elem.bounding_box()
+        if box and chars:
+            sx, sy = box['width']/w, box['height']/h
+            for s in self._select_spots(chars, instr, attempt):
+                await elem.click(position={'x': s['x']*sx, 'y': s['y']*sy}, force=True)
+                await asyncio.sleep(0.5)
+            try:
+                await frame.evaluate("document.querySelector('.verify-btn.show').click()")
+            except:
+                pass
+
+
+# ==================== 主程序模块 ====================
 
 class YuketangHelper:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+        self.session.headers.update({"User-Agent": GLOBAL_UA, "xtbz": "ykt", "Content-Type": "application/json"})
         self.sessionid = None
         self.csrftoken = None
-        self.classroom_id = None
+
+    def _load_state(self):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save_state(self, state):
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, ensure_ascii=False)
 
     def save_session(self):
-        cookies = self.session.cookies.get_dict()
-        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
-        with open(session_file, "w") as f:
-            json.dump(cookies, f)
-        log(f"[*] 登录凭证已保存至 {session_file}！")
+        """持久化 Cookie 和签到记录"""
+        state = self._load_state()
+        if not isinstance(state, dict):
+            state = {}
+        cookies = []
+        for c in self.session.cookies:
+            cookies.append({"name": c.name, "value": c.value, "domain": c.domain, "path": c.path, "expires": c.expires})
+        state["cookies"] = cookies
+        self._save_state(state)
 
     def load_session(self):
-        session_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
+        """从文件恢复 Session，兼容多种历史格式"""
         try:
-            with open(session_file, "r") as f:
-                cookies = json.load(f)
-                self.session.cookies.update(cookies)
-                self.sessionid = cookies.get('sessionid')
-                if 'csrftoken' in cookies:
-                    self.csrftoken = cookies['csrftoken']
-            
+            with open(STATE_FILE, "r") as f:
+                raw = json.load(f)
+
+            if isinstance(raw, list):
+                c_list = raw
+            elif isinstance(raw, dict):
+                c_list = raw.get("cookies", [])
+                if not c_list and 'sessionid' in raw:
+                    self.session.cookies.update(raw)
+                    c_list = []
+            else:
+                return False
+
+            for c in c_list:
+                if not isinstance(c, dict) or 'name' not in c:
+                    continue
+                self.session.cookies.set(
+                    c['name'], c['value'],
+                    domain=c.get('domain', ''),
+                    path=c.get('path', '/'),
+                    expires=int(c.get('expires', 0)) if c.get('expires') else None
+                )
+
+            self.sessionid = self.session.cookies.get('sessionid')
+            self.csrftoken = self.session.cookies.get('csrftoken')
+
             if self.sessionid:
-                log(f"[*] 读取到本地凭证，正在向云端发起全深度校验及保活唤醒...")
-                # 优化保活1：先请求一次前端主页，这是能100%触发后端 Django Session 更新机制和刷新 Token 的行为
                 self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
-                
-                url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
                 self.session.headers.update({"X-CSRFToken": self.csrftoken})
-                resp = self.session.get(url, timeout=10)
-                
-                # 遇到掉线，雨课堂往往不返回 JSON 而是 302 到登录或者返回 HTML
+                resp = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
                 if "application/json" not in resp.headers.get("Content-Type", ""):
-                    log("[-] 本地凭证校验遭到拦截 (接口返回非JSON) ，判断为 Session 已过期。")
-                    self.sessionid = None
                     return False
-                    
                 data = resp.json()
                 if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
-                    log("[+] 凭证效验通过，成功恢复免扫码状态！")
-                    # 校验成功后顺手固化一下可能被更替的新 Cookie
                     self.save_session()
                     return True
-                else:
-                    log("[-] 凭证请求未授权，Session 已失效或被异地顶号，需重新扫码。")
-                    self.sessionid = None
-                    return False
             return False
-        except FileNotFoundError:
-            return False
-        except Exception as e:
-            log(f"[-] 读取或校验凭证时发生致命错误: {e}")
+        except:
             return False
 
-    def _get_wechat_uuid(self, login_url):
-        """核心解析: 从微信授权页面提取原生 UUID"""
+    def _check_cooldown(self, lesson_id):
+        """检查是否在冷却期内"""
+        state = self._load_state()
+        last = state.get("last_checkin") if isinstance(state, dict) else None
+        if not last or str(last.get("lesson_id")) != str(lesson_id):
+            return False
         try:
-            target_url = login_url + "&login_type=jssdk&self_redirect=true"
-            resp = requests.get(target_url, headers={"User-Agent": WECHAT_UA})
-            match = re.search(r'src="/connect/qrcode/([^"]+)"', resp.text)
-            if match:
-                return match.group(1)
-            else:
-                return None
-        except Exception as e:
-            log(f"[!] 提取微信 UUID 出错: {e}")
-            return None
+            elapsed = (datetime.now() - datetime.strptime(last["time"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+            if elapsed < CHECKIN_COOLDOWN_MINUTES:
+                log(f"[*] 课堂 {lesson_id} 在 {int(elapsed)} 分钟前已签到，跳过")
+                return True
+        except:
+            pass
+        return False
+
+    def _record_checkin(self, lesson_id):
+        """记录签到"""
+        state = self._load_state()
+        if not isinstance(state, dict):
+            state = {}
+        state["last_checkin"] = {"lesson_id": str(lesson_id), "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        self._save_state(state)
+
+    def auto_login(self, phone, password):
+        """执行自动化登录（内联调用，不再依赖子进程）"""
+        if not HAS_AUTO_LOGIN:
+            log("[!] 未安装 ddddocr/playwright，无法使用自动登录")
+            return False
+        bot = AutoLogin(phone, password)
+        return asyncio.run(bot.run())
 
     def get_login_qrcode(self):
-        """步骤 1: 向雨课堂申请扫码登录参数并显示二维码"""
-        log("[*] 正在向雨课堂申请登录授权参数...")
-        url = f"{BASE_URL}/api/v3/user/login/wechat-auth-param"
+        log("[*] 正在请求微信授权参数...")
         try:
-            resp = self.session.post(url, json={})
+            resp = self.session.post(f"{BASE_URL}/api/v3/user/login/wechat-auth-param", json={})
             self.csrftoken = resp.cookies.get('csrftoken')
-            
             data = resp.json()
             if data['code'] != 0:
-                log(f"[!] 获取授权参数失败: {data['msg']}")
                 return None, None
-            
-            auth_data = data['data']
-            app_id = auth_data['appId']
-            state = auth_data['state']
-            redirect_uri = auth_data['redirectUri']
-            
-            login_url = f"https://open.weixin.qq.com/connect/qrconnect?appid={app_id}&redirect_uri={redirect_uri}&response_type=code&scope=snsapi_login&state={state}"
-            
-            log("[*] 正在解析原生微信登录凭证...")
-            uuid = self._get_wechat_uuid(login_url)
-            
-            if not uuid:
-                log("[!] 无法获取 UUID，尝试使用降级方案显示二维码。")
-                final_qr_content = login_url + "#wechat_redirect"
-                return state, None
-            
-            # 使用原生的确认登录协议渲染二维码
-            final_qr_content = f"https://open.weixin.qq.com/connect/confirm?uuid={uuid}"
-            print("\n" + "="*50)
-            log("[*] 请使用微信扫描下方二维码进行登录确认：")
+            auth = data['data']
+            login_url = f"https://open.weixin.qq.com/connect/qrconnect?appid={auth['appId']}&redirect_uri={auth['redirectUri']}&response_type=code&scope=snsapi_login&state={auth['state']}"
+            r_wx = requests.get(login_url + "&login_type=jssdk&self_redirect=true", headers={"User-Agent": GLOBAL_UA})
+            uuid = re.search(r'src="/connect/qrcode/([^"]+)"', r_wx.text).group(1)
             qr = qrcode.QRCode()
-            qr.add_data(final_qr_content)
+            qr.add_data(f"https://open.weixin.qq.com/connect/confirm?uuid={uuid}")
             qr.make(fit=True)
             qr.print_ascii(invert=True)
-            print("="*50 + "\n")
-            
-            return state, uuid
-        except Exception as e:
-            log(f"[!] 获取二维码失败 (错误: {e})")
+            log("[*] 请使用微信扫描上方二维码登录")
+            return auth['state'], uuid
+        except:
             return None, None
 
     def wait_for_login_and_callback(self, state, uuid):
-        """核心重构: 轮询微信官方接口获取 code, 并访问雨课堂回调接口完成登录"""
-        if not uuid:
-            log("[!] 缺少 UUID，无法在后台追踪扫码状态。")
-            return False
-            
-        # 1. 轮询微信接口获取授权 code
-        log("[*] 正在轮询微信状态，等待手机确认...")
-        poll_url = f"https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={int(time.time()*1000)}"
-        
+        log("[*] 等待手机端确认...")
         while True:
             try:
-                # 微信轮询不需要复杂的 Header
-                resp = requests.get(poll_url, timeout=30)
-                content = resp.text
-                
-                # 微信返回的是 JS 代码，格式如: window.wx_errcode=XXX;window.wx_code='...';
-                errcode_match = re.search(r'window.wx_errcode=(\d+)', content)
-                if not errcode_match:
-                    continue
-                
-                errcode = int(errcode_match.group(1))
-                if errcode == 405: # 用户已确认登录
-                    code_match = re.search(r"window.wx_code='([^']+)'", content)
-                    if code_match:
-                        auth_code = code_match.group(1)
-                        log("[+] 微信授权成功，获得临时票据。")
-                        return self._finalize_login(auth_code, state)
-                elif errcode == 408: # 超时继续轮询
-                    pass
-                elif errcode == 404: # 已扫码待确认
-                    log("[*] 扫码成功，请在手机上点击确认...")
-                elif errcode == 403: # 二维码真正的失效状态码通常是 403 或其他
-                    log("[!] 二维码可能已失效，请重新运行脚本。")
+                content = requests.get(f"https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={int(time.time()*1000)}", timeout=30).text
+                if 'window.wx_errcode=405' in content:
+                    code = re.search(r"window.wx_code='([^']+)'", content).group(1)
+                    log("[+] 微信授权成功")
+                    return self._finalize_login(code, state)
+                elif 'window.wx_errcode=404' in content:
+                    log("[*] 已扫码，请在手机上点击确认")
+                elif 'window.wx_errcode=403' in content:
                     return False
-                
-                # 更新时间戳以防缓存
-                poll_url = f"https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={int(time.time()*1000)}"
                 time.sleep(2)
             except KeyboardInterrupt:
                 return False
-            except Exception as e:
-                log(f"[!] 轮询微信接口异常: {e}")
+            except:
                 time.sleep(5)
 
     def _finalize_login(self, code, state):
-        """步骤 3: 访问雨课堂回调接口，将微信凭证兑换为 sessionid"""
-        log("[*] 正在进行雨课堂最终握手登录...")
-        callback_url = f"{BASE_URL}/api/v3/user/login/wechat-web-callback"
-        params = {"code": code, "state": state}
-        
         try:
-            # 优化：允许自动跳转，放任服务器进行完整的登录链路重定向，以彻底派发所有持久化 Cookie
-            resp = self.session.get(callback_url, params=params, allow_redirects=True)
-            
-            # 使用全局 Session 获取最新 Cookie
-            cookies_dict = self.session.cookies.get_dict()
-            self.sessionid = cookies_dict.get('sessionid')
-            self.csrftoken = cookies_dict.get('csrftoken') or self.csrftoken
-            
-            if self.sessionid:
-                log("[+] 登录全流程完成！已成功捕获凭据。")
+            self.session.get(f"{BASE_URL}/api/v3/user/login/wechat-web-callback", params={"code": code, "state": state}, allow_redirects=True)
+            if self.session.cookies.get('sessionid'):
                 self.save_session()
                 return True
-            else:
-                log(f"[!] 登录失败，服务器未返回 sessionid。")
-                log(f"|--- HTTP 状态码: {resp.status_code}")
-                log(f"|--- 截获的 Cookie: {cookies_dict}")
-                log(f"|--- Response Headers: {resp.headers}")
-                return False
-        except Exception as e:
-            log(f"[!] 最终登录环节出错: {e}")
+            return False
+        except:
             return False
 
     def get_active_lesson_data(self):
-        """步骤 4: 自动发现活跃课堂"""
-        log("[*] 正在自动检索当前正在进行的课堂...")
-        url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
         try:
-            self.session.headers.update({"X-CSRFToken": self.csrftoken})
-            resp = self.session.get(url)
-            data = resp.json()
-            active_list = data.get('data', {}).get('onLessonClassrooms', [])
-            if not active_list:
-                log("[-] 目前没有检测到正在进行的课堂。")
+            self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
+            data = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam").json()
+            active = data.get('data', {}).get('onLessonClassrooms', [])
+            if not active:
                 return None, None
-            found = active_list[0]
-            return found.get('lessonId'), found.get('classroomId')
-        except Exception as e:
-            log(f"[!] 获取课堂列表失败: {e}")
+            return active[0].get('lessonId'), active[0].get('classroomId')
+        except:
             return None, None
 
     def sign_in(self, lesson_id, classroom_id=None, source=1):
-        """步骤 5: 执行伪装签到"""
-        url = f"{BASE_URL}/api/v3/lesson/checkin"
-        
-        # 极度危险的坑：如果 lesson_id 是 1646245271787354752 这种19位超大 Snowflake ID，
-        # 在 JSON 中裸传数字会被 JS 后端解析成 1646245271787354800 导致精度丢失和找不到课！
-        # 这里自动将其强转为字符串以防范后端溢出。
-        safe_lesson_id = str(lesson_id)
-        
-        # 极度隐蔽的坑2：V3接口要求驼峰命名法 'lessonId'，如果你传 'lesson_id'，后端收到的就是 null！
-        payload = {"lessonId": safe_lesson_id, "source": source}
-        
-        headers = {
-            "X-CSRFToken": self.csrftoken, 
-            "xtbz": "ykt", 
-            "User-Agent": WECHAT_UA,
-            "Referer": f"{BASE_URL}/v2/web/index"
-        }
+        if self._check_cooldown(lesson_id):
+            return
+        payload = {"lessonId": str(lesson_id), "source": source}
+        headers = {"X-CSRFToken": self.csrftoken, "xtbz": "ykt", "User-Agent": GLOBAL_UA, "Referer": f"{BASE_URL}/v2/web/index"}
         if classroom_id:
             headers["Referer"] = f"{BASE_URL}/v2/web/studentLog/{classroom_id}"
-        
-        log(f"[*] 正在伪装微信提交签到 (Lesson: {lesson_id})...")
         try:
-            resp = self.session.post(url, headers=headers, json=payload)
-            result = resp.json()
-            if result.get('code') == 0:
-                log(f"[SUCCESS] 签到完成: {result.get('msg')}")
+            res = self.session.post(f"{BASE_URL}/api/v3/lesson/checkin", headers=headers, json=payload).json()
+            if res.get('code') == 0:
+                log(f"[+] 签到成功 (课堂: {lesson_id})")
+                self._record_checkin(lesson_id)
             else:
-                log(f"[FAILED] 失败: {result.get('msg')}")
+                log(f"[-] 签到失败: {res.get('msg')}")
         except Exception as e:
-            log(f"[ERROR] 异常: {e}")
+            log(f"[!] 签到请求异常: {e}")
 
     def keep_alive(self):
-        """完全模拟浏览器开启主页并查阅列表的深度保活机制"""
         try:
-            # 深度唤醒：强制拉取前端 HTML 页面触发最强刷新
             self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
-            
-            url = f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam"
-            self.session.headers.update({"X-CSRFToken": self.csrftoken})
-            resp = self.session.get(url, timeout=10)
-            
-            if "application/json" not in resp.headers.get("Content-Type", ""):
-                log("[-] 保活校验异常：服务器无视了请求并引发了拦截，Session 已死亡。")
-                return False
-
-            data = resp.json()
-            if isinstance(data, dict) and (data.get("code") == 0 or data.get("success") == True):
-                log("[+] 深度保活包提交成功：当前会话寿命已被重置 (Keep-Alive)。")
+            self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
+            resp = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
+            if resp.json().get('code') == 0:
+                log("[+] 会话保活成功")
                 self.save_session()
                 return True
-            else:
-                log("[-] 保活状态效验异常，Session 可能已被踢出。")
-                return False
-        except Exception as e:
-            log(f"[!] 保活心跳包请求异常: {e}")
+            return False
+        except:
             return False
 
+
+# ==================== 入口 ====================
+
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="雨课堂(Yuketang) 一键自动签到脚本")
-    parser.add_argument("-a", "--auto", action="store_true", help="一键全自动：搜索活跃课程并签到")
-    parser.add_argument("-l", "--lesson", type=str, help="指定目标 Lesson ID 进行签到")
-    parser.add_argument("-s", "--source", type=int, default=1, help="指定模拟签到的 Source 参数 (默认: 1)")
-    parser.add_argument("-k", "--keepalive", action="store_true", help="单次保活模式：刷新凭证有效期后退出")
+    parser = argparse.ArgumentParser(description="雨课堂自动签到助手")
+    parser.add_argument("-a", "--auto", action="store_true", help="自动扫描课堂并签到")
+    parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
+    parser.add_argument("--qr", action="store_true", help="强制使用二维码扫码登录")
+    parser.add_argument("-p", "--phone", type=str, help="手机号（覆盖脚本内置配置）")
+    parser.add_argument("-pw", "--password", type=str, help="密码（覆盖脚本内置配置）")
+    parser.add_argument("--cooldown", type=int, default=CHECKIN_COOLDOWN_MINUTES, help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）")
     args = parser.parse_args()
 
+    CHECKIN_COOLDOWN_MINUTES = args.cooldown
+    phone = args.phone or AUTO_LOGIN_PHONE
+    password = args.password or AUTO_LOGIN_PSWD
+
     helper = YuketangHelper()
-    
-    # 首先尝试热加载本地凭证
-    logged_in = helper.load_session()
-    
-    # 如果没加载到，或者失效，则进入扫码流程
-    if not logged_in:
+    auth = helper.load_session()
+
+    # 登录策略：自动登录 -> 二维码扫码
+    if not auth and not args.qr:
+        if HAS_AUTO_LOGIN:
+            auth = helper.auto_login(phone, password)
+            if auth:
+                auth = helper.load_session()
+        else:
+            log("[*] 未检测到自动登录依赖 (ddddocr/playwright)，跳过自动登录")
+
+    if not auth:
+        log("[*] 进入二维码扫码登录...")
         state, uuid = helper.get_login_qrcode()
         if state and helper.wait_for_login_and_callback(state, uuid):
-            logged_in = True
-            
-    if logged_in:
-        # 如果带有命令行一键打卡参数，则执行后直接退出，作为定时任务的无头模式
-        if args.keepalive:
-            log("[*] CLI模式: 正在执行保活...")
-            helper.keep_alive()
-            sys.exit(0)
+            auth = True
 
-        if args.auto:
+    if not auth:
+        log("[!] 所有登录方式均失败，请检查网络或账号配置")
+        sys.exit(1)
+
+    # 执行功能
+    if args.keepalive:
+        helper.keep_alive()
+        sys.exit(0)
+
+    if args.auto:
+        l_id, c_id = helper.get_active_lesson_data()
+        if l_id:
+            helper.sign_in(l_id, classroom_id=c_id)
+        else:
+            log("[-] 当前没有正在进行的课堂")
+        sys.exit(0)
+
+    # 交互模式
+    while True:
+        print("\n1. 自动扫描签到\n2. 扫码登录\n3. 退出")
+        try:
+            c = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            sys.exit(0)
+        if c == "1":
             l_id, c_id = helper.get_active_lesson_data()
             if l_id:
-                log(f"[*] CLI模式: 发现活跃课程 {l_id}，正在以 source={args.source} 执行签到...")
-                helper.sign_in(l_id, classroom_id=c_id, source=args.source)
+                helper.sign_in(l_id, classroom_id=c_id)
             else:
-                log("[-] 自动巡检未发现正在进行的课堂。")
+                log("[-] 当前没有正在进行的课堂")
+        elif c == "2":
+            s, u = helper.get_login_qrcode()
+            if s:
+                helper.wait_for_login_and_callback(s, u)
+        elif c == "3":
             sys.exit(0)
-            
-        if args.lesson:
-            log(f"[*] CLI模式: 正在强制进入指定课程 {args.lesson}，source={args.source}...")
-            helper.sign_in(args.lesson, classroom_id=None, source=args.source)
-            sys.exit(0)
-
-        # 没有传递参数时，退回原来的交互菜单
-        log("\n[V] 登录会话已就绪！您现在可以反复尝试签到功能，不必重新扫码。")
-        while True:
-            print("\n" + "-"*50)
-            print("【雨课堂辅助菜单】")
-            print("1. 自动扫描课程并用 source=1 签到")
-            print("2. 自动扫描课程，手动输入 source")
-            print("3. 手动输入 lesson_id 和 source")
-            print("4. 退出脚本")
-            
-            try:
-                choice = input("请输入操作对应的数字 (1/2/3/4): ").strip()
-                if choice == "1":
-                    l_id, c_id = helper.get_active_lesson_data()
-                    if l_id:
-                        log(f"[*] 发现课程 {l_id}，正在以微信服务号形式 (source=1) 尝试签到...")
-                        helper.sign_in(l_id, classroom_id=c_id, source=1)
-                    else:
-                        log("[-] 没有发现活跃课堂，请检查当前是否有课。")
-                elif choice == "2":
-                    l_id, c_id = helper.get_active_lesson_data()
-                    if l_id:
-                        print("\n[Source 参数指引] \n 1 扫二维码 (默认)\n 6 课堂暗号\n 9 小程序分享\n 2-5/其他 “正在上课”提示")
-                        req_source = input("\n请输入要使用的 source 值 [默认 1]: ").strip()
-                        req_source = int(req_source) if req_source.isdigit() else 1
-                        log(f"[*] 发现课程 {l_id}，正在尝试使用 source={req_source} 签到...")
-                        helper.sign_in(l_id, classroom_id=c_id, source=req_source)
-                    else:
-                        log("[-] 没有发现活跃课堂，请检查当前是否有课。")
-                elif choice == "3":
-                    target_id = input("请输入目标 Lesson ID: ").strip()
-                    if target_id:
-                        print("\n[Source 参数指引] \n 1 扫二维码 (默认)\n 6 课堂暗号\n 9 小程序分享\n 2-5/其他 “正在上课”提示")
-                        req_source = input("\n请输入要使用的 source 值 [默认 1]: ").strip()
-                        req_source = int(req_source) if req_source.isdigit() else 1
-                        helper.sign_in(target_id, classroom_id=None, source=req_source)
-                elif choice == "4":
-                    log("[*] 结束退出。您的本地登录凭证仍在有效期内！下次启动可免扫码。")
-                    sys.exit(0)
-                else:
-                    print("[!] 无效的选择，请重新输入。")
-            except KeyboardInterrupt:
-                log("监测到终端退出指令")
-                sys.exit(0)
-            except Exception as e:
-                # 捕获未知异常，防止死循环崩盘
-                log(f"[!] 发生意外错误，但已阻止强制退出: {e}")
