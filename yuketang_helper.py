@@ -20,8 +20,8 @@ except ImportError:
     HAS_AUTO_LOGIN = False
 
 # ========== 用户配置 ==========
-AUTO_LOGIN_PHONE = "[ACCOUNT]"
-AUTO_LOGIN_PSWD = "[PASSWORD]"
+AUTO_LOGIN_PHONE = ""
+AUTO_LOGIN_PSWD = ""
 CHECKIN_COOLDOWN_MINUTES = 30
 # ==============================
 
@@ -44,6 +44,7 @@ class AutoLogin:
         self.ocr = ddddocr.DdddOcr(show_ad=False)
         self.det = ddddocr.DdddOcr(det=True, show_ad=False)
         self.slider_ocr = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
+        self.error_msg = None  # 用于记录账密错误等业务异常
 
     def _select_spots(self, char_map, instruction, attempt):
         """坐标排序：语义占位 + 地理回填"""
@@ -92,11 +93,43 @@ class AutoLogin:
                 pass
             await page.fill('input[name="loginname"]', self.phone)
             await page.fill('input[type="password"]', self.password)
+            
+            # 监听登录接口的原始响应，捕获账密错误
+            async def handle_response(response):
+                if "/api/v3/user/login/password" in response.url:
+                    try:
+                        if "application/json" in response.headers.get("content-type", "").lower():
+                            data = await response.json()
+                            code = data.get('code')
+                            # -10 代表需要验证码，0 代表成功。其他 code 均视为业务报错
+                            if code is not None and code != 0 and code != -10:
+                                self.error_msg = data.get('msg') or data.get('message') or f"错误代码: {code}"
+                    except: pass
+            page.on("response", handle_response)
+            
             await page.locator('.submit-btn.login-btn').click()
 
             ok = False
             for attempt in range(15):
                 await asyncio.sleep(2.5)
+                
+                # 检查页面上所有可能的红色错误提示条
+                try:
+                    # 获取所有 el-message__content 或者包含 err/error 字样的可见元素文本
+                    msg_els = await page.locator('.el-message__content, .err-msg, .error-msg, [role="alert"]').all()
+                    for el in msg_els:
+                        if await el.is_visible():
+                            txt = await el.text_content()
+                            if txt and len(txt.strip()) > 0:
+                                self.error_msg = txt.strip()
+                                break
+                except: pass
+
+                # 若捕获到业务错误（如密码错、手机号未注册等），终止流程
+                if self.error_msg:
+                    log(f"[-] 登录失败: {self.error_msg}")
+                    break
+
                 if any(c['name'] == 'sessionid' for c in await ctx.cookies()):
                     ok = True; break
 
@@ -254,7 +287,8 @@ class YuketangHelper:
             if self.sessionid:
                 self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
                 self.session.headers.update({"X-CSRFToken": self.csrftoken})
-                resp = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
+                # 更换为轻量级的基本信息探针
+                resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
                 if "application/json" not in resp.headers.get("Content-Type", ""):
                     return False
                 data = resp.json()
@@ -378,7 +412,8 @@ class YuketangHelper:
         try:
             self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
             self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
-            resp = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
+            # 使用基础用户信息接口进行心跳保活，极低服务器开销
+            resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
             if resp.json().get('code') == 0:
                 log("[+] 会话保活成功")
                 self.save_session()
