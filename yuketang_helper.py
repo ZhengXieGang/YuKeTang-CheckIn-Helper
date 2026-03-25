@@ -439,6 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--phone", type=str, help="手机号（覆盖脚本内置配置）")
     parser.add_argument("-pw", "--password", type=str, help="密码（覆盖脚本内置配置）")
     parser.add_argument("--cooldown", type=int, default=CHECKIN_COOLDOWN_MINUTES, help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）")
+    parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，每分钟自动检测并签到")
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
@@ -480,9 +481,28 @@ if __name__ == "__main__":
             log("[-] 当前没有正在进行的课堂")
         sys.exit(0)
 
+    # 定时签到模式
+    if args.schedule is not None:
+        delay = args.schedule
+        if delay > 0:
+            log(f"[*] 将在 {delay} 分钟后开始自动签到循环...")
+            time.sleep(delay * 60)
+        log("[*] 开始自动签到循环（每 60 秒检测一次，Ctrl+C 退出）")
+        try:
+            while True:
+                l_id, c_id = helper.get_active_lesson_data()
+                if l_id:
+                    helper.sign_in(l_id, classroom_id=c_id)
+                else:
+                    log("[-] 当前没有正在进行的课堂，60 秒后重试...")
+                time.sleep(60)
+        except KeyboardInterrupt:
+            log("[*] 已停止定时签到")
+        sys.exit(0)
+
     # 交互模式
     while True:
-        print("\n1. 自动扫描签到\n2. 扫码登录\n3. 退出")
+        print("\n1. 自动扫描签到\n2. 扫码登录\n3. 定时签到\n4. 退出")
         try:
             c = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -498,4 +518,23 @@ if __name__ == "__main__":
             if s:
                 helper.wait_for_login_and_callback(s, u)
         elif c == "3":
+            try:
+                n = int(input("请输入延迟分钟数 (0 = 立即开始): ").strip())
+            except (ValueError, KeyboardInterrupt, EOFError):
+                continue
+            if n > 0:
+                log(f"[*] 将在 {n} 分钟后开始自动签到循环...")
+                time.sleep(n * 60)
+            log("[*] 开始自动签到循环（每 60 秒检测一次，Ctrl+C 返回菜单）")
+            try:
+                while True:
+                    l_id, c_id = helper.get_active_lesson_data()
+                    if l_id:
+                        helper.sign_in(l_id, classroom_id=c_id)
+                    else:
+                        log("[-] 当前没有正在进行的课堂，60 秒后重试...")
+                    time.sleep(60)
+            except KeyboardInterrupt:
+                log("[*] 已停止定时签到，返回菜单")
+        elif c == "4":
             sys.exit(0)
