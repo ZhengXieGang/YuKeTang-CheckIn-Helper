@@ -25,7 +25,7 @@ AUTO_LOGIN_PSWD = ""
 CHECKIN_COOLDOWN_MINUTES = 30
 # ==============================
 
-GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 BASE_URL = "https://changjiang.yuketang.cn"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
 
@@ -245,13 +245,17 @@ class YuketangHelper:
             json.dump(state, f, ensure_ascii=False)
 
     def save_session(self):
-        """持久化 Cookie 和签到记录"""
+        """持久化 Cookie 和签到记录，增强 Session 提权逻辑"""
         state = self._load_state()
         if not isinstance(state, dict):
             state = {}
         cookies = []
+        # 将无过期时间的 Session Cookie 提权为一年长效
+        future = int(time.time()) + 86400 * 365
         for c in self.session.cookies:
-            cookies.append({"name": c.name, "value": c.value, "domain": c.domain, "path": c.path, "expires": c.expires})
+            # 如果是 Session 级 Cookie (expires 为空或 0)，则强制设为长效
+            exp = c.expires or future
+            cookies.append({"name": c.name, "value": c.value, "domain": c.domain, "path": c.path, "expires": exp})
         state["cookies"] = cookies
         self._save_state(state)
 
@@ -385,6 +389,7 @@ class YuketangHelper:
             self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
             data = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam").json()
             active = data.get('data', {}).get('onLessonClassrooms', [])
+            self.save_session() # 实时同步状态
             if not active:
                 return None, None
             return active[0].get('lessonId'), active[0].get('classroomId')
@@ -403,6 +408,7 @@ class YuketangHelper:
             if res.get('code') == 0:
                 log(f"[+] 签到成功 (课堂: {lesson_id})")
                 self._record_checkin(lesson_id)
+                self.save_session() # 签到成功后同步最新 Cookie (可能有后端轮转)
             else:
                 log(f"[-] 签到失败: {res.get('msg')}")
         except Exception as e:
