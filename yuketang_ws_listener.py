@@ -16,10 +16,14 @@ try:
 except ImportError:
     HAS_MQTT = False
 
-BASE_URL = "https://changjiang.yuketang.cn"
-GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-WEBSOCKET_ENDPOINTS = ["wss://changjiang.yuketang.cn/wsapp/", "wss://pre-apple-emqx.xuetangonline.com:8083/mqtt"]
+# ========== 用户配置 ==========
+BASE_DOMAIN = "changjiang.yuketang.cn"  # 可改为: huanghe/hehua/changjiang 等
 SESSION_FILE = "yuketang_session.json"
+# ==============================
+
+BASE_URL = f"https://{BASE_DOMAIN}"
+GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+WEBSOCKET_ENDPOINTS = [f"wss://{BASE_DOMAIN}/wsapp/", "wss://pre-apple-emqx.xuetangonline.com:8083/mqtt"]
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")

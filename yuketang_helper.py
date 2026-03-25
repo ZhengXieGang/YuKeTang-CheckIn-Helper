@@ -20,13 +20,14 @@ except ImportError:
     HAS_AUTO_LOGIN = False
 
 # ========== 用户配置 ==========
+BASE_DOMAIN = "changjiang.yuketang.cn"  # 可改为: huanghe/hehua/changjiang 等
 AUTO_LOGIN_PHONE = ""
 AUTO_LOGIN_PSWD = ""
 CHECKIN_COOLDOWN_MINUTES = 30
 # ==============================
 
 GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-BASE_URL = "https://changjiang.yuketang.cn"
+BASE_URL = f"https://{BASE_DOMAIN}"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
 
 def log(msg):

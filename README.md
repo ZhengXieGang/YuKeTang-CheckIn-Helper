@@ -54,6 +54,17 @@ python yuketang_helper.py
 
 ### 账号配置
 
+**域名配置**（支持不同雨课堂服务器）：
+编辑脚本开头的 `BASE_DOMAIN` 常量：
+```python
+BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
+# BASE_DOMAIN = "huanghe.yuketang.cn"   # 黄河雨课堂
+# BASE_DOMAIN = "pro.yuketang.cn"       # 荷花雨课堂
+# BASE_DOMAIN = "yuketang.cn"           # 雨课堂
+```
+
+**账号密码配置**：
+
 **方式一**：编辑脚本开头的配置区
 ```python
 AUTO_LOGIN_PHONE = "你的手机号"
