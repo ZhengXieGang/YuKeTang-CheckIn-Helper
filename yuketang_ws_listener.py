@@ -4,6 +4,7 @@
 支持两种方案：API 越权获取 + WebSocket 监听
 """
 import json
+import os
 import re
 import sys
 import time
@@ -17,8 +18,9 @@ except ImportError:
     HAS_MQTT = False
 
 # ========== 用户配置 ==========
-BASE_DOMAIN = "changjiang.yuketang.cn"  # 可改为: huanghe/hehua/changjiang 等
-SESSION_FILE = "yuketang_session.json"
+BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSION_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
 # ==============================
 
 BASE_URL = f"https://{BASE_DOMAIN}"
@@ -27,6 +29,23 @@ WEBSOCKET_ENDPOINTS = [f"wss://{BASE_DOMAIN}/wsapp/", "wss://pre-apple-emqx.xuet
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def normalize_cookie_record(cookie):
+    if not isinstance(cookie, dict) or 'name' not in cookie:
+        return None
+    expires = cookie.get('expires')
+    try:
+        expires = int(expires) if expires not in (None, "", 0, "0") else None
+    except:
+        expires = None
+    return {
+        "name": cookie['name'],
+        "value": cookie.get('value', ''),
+        "domain": cookie.get('domain') or BASE_DOMAIN,
+        "path": cookie.get('path') or '/',
+        "expires": expires,
+    }
 
 class YuketangTester:
     def __init__(self, session_file=SESSION_FILE):
@@ -38,15 +57,26 @@ class YuketangTester:
     def load_session(self):
         try:
             with open(self.session_file, 'r') as f:
-                data = json.load(f)
-            cookies = data.get("cookies", [])
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                cookies = raw.get("cookies", [])
+            elif isinstance(raw, list):
+                cookies = raw
+            else:
+                cookies = []
             for c in cookies:
-                if isinstance(c, dict) and 'name' in c:
-                    self.session.cookies.set(c['name'], c['value'], domain=c.get('domain', ''), path=c.get('path', '/'))
+                item = normalize_cookie_record(c)
+                if not item:
+                    continue
+                kwargs = {"domain": item["domain"], "path": item["path"]}
+                if item["expires"]:
+                    kwargs["expires"] = item["expires"]
+                self.session.cookies.set(item["name"], item["value"], **kwargs)
             self.csrftoken = self.session.cookies.get('csrftoken')
-            self.session.headers.update({"X-CSRFToken": self.csrftoken})
+            if self.csrftoken:
+                self.session.headers.update({"X-CSRFToken": self.csrftoken})
             resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
-            if resp.json().get("code") == 0:
+            if "application/json" in resp.headers.get("Content-Type", "") and resp.json().get("code") == 0:
                 log("[+] Session 加载成功")
                 return True
             log("[-] Session 已失效")

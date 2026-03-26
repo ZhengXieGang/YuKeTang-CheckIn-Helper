@@ -7,20 +7,26 @@ import os
 import re
 import asyncio
 import argparse
+from io import BytesIO
 from datetime import datetime
 
 # 检测可选依赖是否可用
 try:
+    from playwright.async_api import async_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    async_playwright = None
+    HAS_PLAYWRIGHT = False
+
+try:
     import ddddocr
     from PIL import Image
-    from io import BytesIO
-    from playwright.async_api import async_playwright
-    HAS_AUTO_LOGIN = True
+    HAS_AUTO_LOGIN = HAS_PLAYWRIGHT
 except ImportError:
     HAS_AUTO_LOGIN = False
 
 # ========== 用户配置 ==========
-BASE_DOMAIN = "changjiang.yuketang.cn"  # 可改为: huanghe/hehua/changjiang 等
+BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
 AUTO_LOGIN_PHONE = ""
 AUTO_LOGIN_PSWD = ""
 CHECKIN_COOLDOWN_MINUTES = 30
@@ -28,10 +34,76 @@ CHECKIN_COOLDOWN_MINUTES = 30
 
 GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 BASE_URL = f"https://{BASE_DOMAIN}"
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
+BROWSER_SYNC_WAIT_SECONDS = 6
 
 def log(msg):
     print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}")
+
+
+def read_json_file(path, default):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except:
+        return default
+
+
+def write_json_file(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_state_dict():
+    state = read_json_file(STATE_FILE, {})
+    return state if isinstance(state, dict) else {}
+
+
+def normalize_cookie_record(cookie):
+    if not isinstance(cookie, dict) or "name" not in cookie:
+        return None
+    expires = cookie.get("expires")
+    try:
+        expires = int(expires) if expires not in (None, "", 0, "0") else None
+    except:
+        expires = None
+    return {
+        "name": cookie["name"],
+        "value": cookie.get("value", ""),
+        "domain": cookie.get("domain") or BASE_DOMAIN,
+        "path": cookie.get("path") or "/",
+        "expires": expires,
+        "secure": bool(cookie.get("secure", False)),
+    }
+
+
+def persist_cookie_records(cookies):
+    state = load_state_dict()
+    future = int(time.time()) + 86400 * 365
+    normalized = []
+    for cookie in cookies:
+        item = normalize_cookie_record(cookie)
+        if not item:
+            continue
+        item["expires"] = item["expires"] or future
+        normalized.append(item)
+    state["cookies"] = normalized
+    write_json_file(STATE_FILE, state)
+
+
+def persist_browser_state(storage_state):
+    state = load_state_dict()
+    state["browser_state"] = storage_state
+    write_json_file(STATE_FILE, state)
+
+
+def load_browser_state():
+    state = load_state_dict()
+    browser_state = state.get("browser_state")
+    if isinstance(browser_state, dict):
+        return browser_state
+    return None
 
 
 # ==================== 自动登录模块（内联） ====================
@@ -164,13 +236,21 @@ class AutoLogin:
                     except:
                         pass
 
-            await asyncio.sleep(2)
+            if ok:
+                try:
+                    await page.goto(f"{BASE_URL}/v2/web/index", wait_until="load", timeout=20000)
+                except:
+                    pass
+                await asyncio.sleep(BROWSER_SYNC_WAIT_SECONDS)
+            else:
+                await asyncio.sleep(2)
             cookies = await ctx.cookies()
+            storage_state = await ctx.storage_state()
             await browser.close()
 
             if ok and any(c['name'] == 'sessionid' for c in cookies):
-                with open(STATE_FILE, "w") as f:
-                    json.dump({"cookies": cookies}, f)
+                persist_cookie_records(cookies)
+                persist_browser_state(storage_state)
                 log("[+] 自动登录成功，Session 已保存")
                 return True
             log("[-] 自动登录未能通过验证")
@@ -235,72 +315,195 @@ class YuketangHelper:
         self.csrftoken = None
 
     def _load_state(self):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
+        return load_state_dict()
 
     def _save_state(self, state):
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False)
+        write_json_file(STATE_FILE, state)
+
+    def _refresh_session_fields(self):
+        self.sessionid = self.session.cookies.get('sessionid')
+        self.csrftoken = self.session.cookies.get('csrftoken')
+        self.session.headers.update({"User-Agent": GLOBAL_UA, "xtbz": "ykt", "Content-Type": "application/json"})
+        if self.csrftoken:
+            self.session.headers.update({"X-CSRFToken": self.csrftoken})
+        else:
+            self.session.headers.pop("X-CSRFToken", None)
+
+    def _cookie_records_from_jar(self):
+        cookies = []
+        for c in self.session.cookies:
+            cookies.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path,
+                "expires": c.expires,
+                "secure": bool(c.secure),
+            })
+        return cookies
+
+    def _set_cookie_records(self, cookies, clear=False):
+        if clear:
+            self.session.cookies.clear()
+        for c in cookies:
+            item = normalize_cookie_record(c)
+            if not item:
+                continue
+            kwargs = {"domain": item["domain"], "path": item["path"]}
+            if item["expires"]:
+                kwargs["expires"] = int(item["expires"])
+            self.session.cookies.set(item["name"], item["value"], **kwargs)
+        self._refresh_session_fields()
+
+    def _load_cookies_from_state(self):
+        raw = self._load_state()
+        if isinstance(raw, list):
+            c_list = raw
+        elif isinstance(raw, dict):
+            c_list = raw.get("cookies", [])
+            if not c_list and 'sessionid' in raw:
+                c_list = [
+                    {"name": k, "value": v, "domain": BASE_DOMAIN, "path": "/"}
+                    for k, v in raw.items()
+                    if isinstance(v, str)
+                ]
+        else:
+            return False
+        self._set_cookie_records(c_list, clear=True)
+        return bool(self.session.cookies)
+
+    def _probe_session(self):
+        if not self.session.cookies.get('sessionid'):
+            return False
+        try:
+            self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
+            self._refresh_session_fields()
+            resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
+            if "application/json" not in resp.headers.get("Content-Type", ""):
+                return False
+            data = resp.json()
+            if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
+                self._refresh_session_fields()
+                self.save_session()
+                return True
+        except:
+            return False
+        return False
+
+    def _cookies_for_playwright(self):
+        result = []
+        for c in self.session.cookies:
+            item = {
+                "name": c.name,
+                "value": c.value,
+                "path": c.path or "/",
+                "secure": bool(c.secure),
+            }
+            if c.expires:
+                item["expires"] = int(c.expires)
+            if c.domain:
+                item["domain"] = c.domain
+            else:
+                item["url"] = BASE_URL
+            result.append(item)
+        return result
+
+    async def _sync_with_browser(self, storage_state=None, seed_cookies=None):
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context_kwargs = {"user_agent": GLOBAL_UA}
+            if storage_state:
+                context_kwargs["storage_state"] = storage_state
+            ctx = await browser.new_context(**context_kwargs)
+            if seed_cookies:
+                await ctx.add_cookies(seed_cookies)
+            page = await ctx.new_page()
+            try:
+                await page.goto(f"{BASE_URL}/v2/web/index", wait_until="load", timeout=25000)
+            except:
+                try:
+                    await page.goto(f"{BASE_URL}/v2/web/index", timeout=25000)
+                except:
+                    pass
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass
+            try:
+                await page.evaluate(
+                    """async () => {
+                        const urls = [
+                            '/api/v3/user/basic-info',
+                            '/api/v3/classroom/on-lesson-upcoming-exam'
+                        ];
+                        for (const url of urls) {
+                            try {
+                                await fetch(url, {credentials: 'include'});
+                            } catch (e) {}
+                        }
+                    }"""
+                )
+            except:
+                pass
+            await asyncio.sleep(BROWSER_SYNC_WAIT_SECONDS)
+            cookies = await ctx.cookies()
+            storage_state = await ctx.storage_state()
+            await browser.close()
+            return cookies, storage_state
+
+    def _bootstrap_browser_state(self):
+        if not HAS_PLAYWRIGHT or not self.session.cookies.get('sessionid'):
+            return False
+        try:
+            cookies, storage_state = asyncio.run(
+                self._sync_with_browser(seed_cookies=self._cookies_for_playwright())
+            )
+        except Exception as e:
+            log(f"[!] 浏览器态同步失败: {e}")
+            return False
+        if not cookies:
+            return False
+        self._set_cookie_records(cookies, clear=True)
+        persist_browser_state(storage_state)
+        if self._probe_session():
+            log("[+] 已同步浏览器登录态")
+            return True
+        return False
+
+    def _rehydrate_session_from_browser_state(self):
+        browser_state = load_browser_state()
+        if not HAS_PLAYWRIGHT or not browser_state:
+            return False
+        log("[*] Cookie 已失效，尝试用浏览器登录态恢复...")
+        try:
+            cookies, storage_state = asyncio.run(
+                self._sync_with_browser(storage_state=browser_state)
+            )
+        except Exception as e:
+            log(f"[!] 浏览器登录态恢复失败: {e}")
+            return False
+        if not any(c.get('name') == 'sessionid' for c in cookies):
+            return False
+        self._set_cookie_records(cookies, clear=True)
+        persist_browser_state(storage_state)
+        if self._probe_session():
+            log("[+] 已从浏览器登录态恢复会话")
+            return True
+        return False
 
     def save_session(self):
         """持久化 Cookie 和签到记录，增强 Session 提权逻辑"""
-        state = self._load_state()
-        if not isinstance(state, dict):
-            state = {}
-        cookies = []
-        # 将无过期时间的 Session Cookie 提权为一年长效
-        future = int(time.time()) + 86400 * 365
-        for c in self.session.cookies:
-            # 如果是 Session 级 Cookie (expires 为空或 0)，则强制设为长效
-            exp = c.expires or future
-            cookies.append({"name": c.name, "value": c.value, "domain": c.domain, "path": c.path, "expires": exp})
-        state["cookies"] = cookies
-        self._save_state(state)
+        self._refresh_session_fields()
+        persist_cookie_records(self._cookie_records_from_jar())
 
     def load_session(self):
         """从文件恢复 Session，兼容多种历史格式"""
         try:
-            with open(STATE_FILE, "r") as f:
-                raw = json.load(f)
-
-            if isinstance(raw, list):
-                c_list = raw
-            elif isinstance(raw, dict):
-                c_list = raw.get("cookies", [])
-                if not c_list and 'sessionid' in raw:
-                    self.session.cookies.update(raw)
-                    c_list = []
-            else:
-                return False
-
-            for c in c_list:
-                if not isinstance(c, dict) or 'name' not in c:
-                    continue
-                self.session.cookies.set(
-                    c['name'], c['value'],
-                    domain=c.get('domain', ''),
-                    path=c.get('path', '/'),
-                    expires=int(c.get('expires', 0)) if c.get('expires') else None
-                )
-
-            self.sessionid = self.session.cookies.get('sessionid')
-            self.csrftoken = self.session.cookies.get('csrftoken')
-
-            if self.sessionid:
-                self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
-                self.session.headers.update({"X-CSRFToken": self.csrftoken})
-                # 更换为轻量级的基本信息探针
-                resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
-                if "application/json" not in resp.headers.get("Content-Type", ""):
-                    return False
-                data = resp.json()
-                if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
-                    self.save_session()
-                    return True
-            return False
+            if self._load_cookies_from_state() and self._probe_session():
+                if HAS_PLAYWRIGHT and not load_browser_state():
+                    self._bootstrap_browser_state()
+                return True
+            return self._rehydrate_session_from_browser_state()
         except:
             return False
 
@@ -339,7 +542,8 @@ class YuketangHelper:
         log("[*] 正在请求微信授权参数...")
         try:
             resp = self.session.post(f"{BASE_URL}/api/v3/user/login/wechat-auth-param", json={})
-            self.csrftoken = resp.cookies.get('csrftoken')
+            self._refresh_session_fields()
+            self.csrftoken = self.session.cookies.get('csrftoken') or resp.cookies.get('csrftoken')
             data = resp.json()
             if data['code'] != 0:
                 return None, None
@@ -378,8 +582,11 @@ class YuketangHelper:
     def _finalize_login(self, code, state):
         try:
             self.session.get(f"{BASE_URL}/api/v3/user/login/wechat-web-callback", params={"code": code, "state": state}, allow_redirects=True)
+            self._refresh_session_fields()
             if self.session.cookies.get('sessionid'):
                 self.save_session()
+                if HAS_PLAYWRIGHT:
+                    self._bootstrap_browser_state()
                 return True
             return False
         except:
@@ -387,6 +594,7 @@ class YuketangHelper:
 
     def get_active_lesson_data(self):
         try:
+            self._refresh_session_fields()
             self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
             data = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam").json()
             active = data.get('data', {}).get('onLessonClassrooms', [])
@@ -400,6 +608,7 @@ class YuketangHelper:
     def sign_in(self, lesson_id, classroom_id=None, source=1):
         if self._check_cooldown(lesson_id):
             return
+        self._refresh_session_fields()
         payload = {"lessonId": str(lesson_id), "source": source}
         headers = {"X-CSRFToken": self.csrftoken, "xtbz": "ykt", "User-Agent": GLOBAL_UA, "Referer": f"{BASE_URL}/v2/web/index"}
         if classroom_id:
@@ -424,6 +633,7 @@ class YuketangHelper:
         3. 用暗号完成签到
         """
         log("[*] 尝试越权获取动态签到暗号...")
+        self._refresh_session_fields()
         
         # 第一步：以桌面端身份(source=10)获取 lessonToken
         try:
@@ -486,6 +696,7 @@ class YuketangHelper:
         """使用手动输入的 5 位暗号(ticket)完成动态二维码签到"""
         log(f"[*] 正在使用暗号 [{ticket}] 签到...")
         try:
+            self._refresh_session_fields()
             # 尝试新接口 (source=14 表示扫码签到)
             payload = {"lessonId": str(lesson_id), "source": 14, "inviteCode": str(ticket)}
             headers = {"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA, "xtbz": "ykt"}
@@ -524,6 +735,7 @@ class YuketangHelper:
     def keep_alive(self):
         try:
             self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
+            self._refresh_session_fields()
             self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
             # 使用基础用户信息接口进行心跳保活，极低服务器开销
             resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
