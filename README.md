@@ -1,32 +1,23 @@
 # 雨课堂自动签到助手
 
-长江雨课堂全自动签到工具。支持账号密码自动登录（含验证码破解）和微信扫码登录，单文件运行，配合 Cron 定时任务可以实现 24/7 无人值守。
+长江雨课堂全自动签到工具。现已全面切换为桌面端二维码登录，单文件运行，配合 Cron 定时任务可以实现长期保活与自动签到。
 
 ## 功能和特性
 
-- **全自动账密登录**：基于 Playwright + ddddocr，无头浏览器自动识别并通过腾讯天御人机验证（汉字点选 / 滑块拼图）
-- **微信扫码登录**：终端内显示二维码，手机扫码即可认证
-- **智能降级**：未安装 ddddocr/playwright 时自动跳过自动登录，退回到二维码扫码
+- **桌面端扫码登录**：终端内显示桌面端登录二维码，手机扫码即可认证
 - **自动签到**：自动扫描当前正在进行的课堂并完成签到
-- **动态二维码签到**：支持 API 越权和 WebSocket 监听两种方案获取动态暗号
+- **动态二维码签到测试工具**：独立脚本支持 API 越权和 WebSocket 监听两种方案获取动态暗号
 - **签到去重**：同一课堂在冷却期内（默认 30 分钟）不会重复签到
-- **Session 持久化**：全量保存 Cookie 属性（含 Domain/Path/Expires），确保 Session 长期有效
+- **桌面端登录态持久化**：统一保存在 `yuketang_session.json` 中，自动保存轮转后的 `desktop_auth` 或桌面端 Cookie
 - **会话保活**：定期刷新 Session，防止过期掉线
-- **凭据优先级**：命令行参数 > 脚本内置配置
+- **单状态文件**：始终只使用一个 `yuketang_session.json`
 
 ## 环境要求
 
-### 最低依赖（仅扫码登录）
+### 运行依赖
 
 ```bash
 pip install requests qrcode
-```
-
-### 完整依赖（含自动登录）
-
-```bash
-pip install requests qrcode ddddocr playwright Pillow
-playwright install chromium
 ```
 
 ### 动态二维码签到（可选）
@@ -35,27 +26,24 @@ playwright install chromium
 pip install paho-mqtt
 ```
 
-> 未安装完整依赖时，脚本会自动退回到二维码扫码模式，不会报错。
-
 ## 使用方法
 
 ### 基础用法
 
 ```bash
-# 自动登录 + 签到（需完整依赖）
+# 自动登录态加载 + 自动签到
 python yuketang_helper.py -a
 
-# 强制扫码登录
+# 强制重新扫码登录
 python yuketang_helper.py --qr
 
 # 交互模式
 python yuketang_helper.py
 ```
 
-### 账号配置
+### 域名配置
 
-**域名配置**（支持不同雨课堂服务器）：
-编辑脚本开头的 `BASE_DOMAIN` 常量：
+支持不同雨课堂服务器，编辑脚本开头的 `BASE_DOMAIN` 常量：
 ```python
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 # BASE_DOMAIN = "huanghe.yuketang.cn"   # 黄河雨课堂
@@ -63,18 +51,9 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 # BASE_DOMAIN = "yuketang.cn"           # 雨课堂
 ```
 
-**账号密码配置**：
+### 兼容参数
 
-**方式一**：编辑脚本开头的配置区
-```python
-AUTO_LOGIN_PHONE = "你的手机号"
-AUTO_LOGIN_PSWD = "你的密码"
-```
-
-**方式二**：命令行参数（优先级更高）
-```bash
-python yuketang_helper.py -a -p [手机号] -pw [密码]
-```
+脚本已不再支持账号密码登录，`-p/-pw` 仅为兼容老命令保留，当前会被忽略。
 
 ### 命令行参数
 
@@ -82,12 +61,11 @@ python yuketang_helper.py -a -p [手机号] -pw [密码]
 |------|------|
 | `-a` / `--auto` | 自动扫描课堂并签到 |
 | `-k` / `--keepalive` | 仅执行会话保活 |
-| `-p` / `--phone` | 手机号 |
-| `-pw` / `--password` | 密码 |
-| `--qr` | 强制使用二维码扫码登录 |
+| `-p` / `--phone` | 已弃用，仅为兼容保留 |
+| `-pw` / `--password` | 已弃用，仅为兼容保留 |
+| `--qr` | 强制重新显示桌面端登录二维码 |
 | `--cooldown N` | 签到去重冷却时间（分钟，默认 30） |
-| `--dynamic` | 尝试动态二维码签到（API 越权方案） |
-| `--ticket CODE` | 手动输入 5 位暗号完成动态签到 |
+| `-s N` / `--schedule N` | 延迟 N 分钟后开始，每分钟检测一次课堂并签到 |
 
 ### 动态二维码签到
 
@@ -98,15 +76,6 @@ python yuketang_ws_listener.py
 # 1 - API 越权方案
 # 2 - WebSocket 监听方案
 # 3 - 两种都测试
-```
-
-**主程序使用**：
-```bash
-# 尝试 API 越权获取动态暗号
-python yuketang_helper.py --dynamic
-
-# 手动输入暗号
-python yuketang_helper.py --ticket 12345
 ```
 
 ### Cron 定时任务示例
@@ -124,9 +93,9 @@ python yuketang_helper.py --ticket 12345
 
 | 文件 | 说明 |
 |------|------|
-| `yuketang_helper.py` | 主程序，包含自动登录、签到、保活全部功能 |
+| `yuketang_helper.py` | 主程序，包含桌面端扫码登录、签到、保活 |
 | `yuketang_ws_listener.py` | 动态二维码测试工具（独立脚本） |
-| `yuketang_session.json` | 持久化状态文件（Cookie + 签到记录），自动生成 |
+| `yuketang_session.json` | 持久化状态文件（`desktop_auth` / `desktop_cookies` + 签到记录），自动生成 |
 | `yuketang_technical_handover.md` | 技术移交文档，包含逆向分析过程 |
 
 ## 签到去重机制
