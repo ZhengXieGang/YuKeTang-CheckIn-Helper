@@ -150,6 +150,22 @@ class YuketangTester:
             )
         )
 
+    def _describe_login_state(self):
+        cookie_map = {cookie.name: cookie for cookie in self.session.cookies}
+        for name in ("sid", "sessionid"):
+            cookie = cookie_map.get(name)
+            if not cookie:
+                continue
+            expires = (
+                datetime.fromtimestamp(cookie.expires).strftime("%Y-%m-%d %H:%M:%S")
+                if cookie.expires
+                else "session"
+            )
+            return f"{name} 有效至 {expires}"
+        if self.desktop_auth:
+            return "Authorization 已加载"
+        return "无可用登录态"
+
     def save_session(self):
         state = self._load_state()
         if not isinstance(state, dict):
@@ -215,7 +231,7 @@ class YuketangTester:
                 log("[+] Desktop Token 加载成功")
                 return True
             if mode == "cookie":
-                log("[+] Desktop Cookie 加载成功")
+                log(f"[+] Desktop Cookie 加载成功，{self._describe_login_state()}")
                 return True
             log("[-] 桌面端登录态已失效")
             return False

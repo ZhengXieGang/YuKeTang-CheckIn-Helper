@@ -143,17 +143,35 @@ class YuketangHelper:
             )
         )
 
-    def _describe_cookie_state(self):
-        parts = []
-        for cookie in sorted(self.session.cookies, key=lambda item: item.name):
-            if cookie.name not in {"sid", "sessionid"}:
+    def _get_cookie_map(self):
+        result = {}
+        for cookie in self.session.cookies:
+            result[cookie.name] = {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": cookie.domain or BASE_DOMAIN,
+                "path": cookie.path or "/",
+                "expires": int(cookie.expires) if cookie.expires else None,
+                "secure": bool(cookie.secure),
+            }
+        return result
+
+    def _describe_login_state(self):
+        cookie_map = self._get_cookie_map()
+        for name in ("sid", "sessionid"):
+            cookie = cookie_map.get(name)
+            if not cookie:
                 continue
-            if cookie.expires:
-                expires = datetime.fromtimestamp(cookie.expires).strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                expires = "session"
-            parts.append(f"{cookie.name}(exp={expires})")
-        return ", ".join(parts) or "无"
+            expires = cookie.get("expires")
+            expires_text = (
+                datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
+                if expires
+                else "session"
+            )
+            return f"{name} 有效至 {expires_text}"
+        if self.desktop_auth:
+            return "Authorization 已加载"
+        return "无可用登录态"
 
     def save_session(self):
         state = self._load_state()
@@ -245,7 +263,7 @@ class YuketangHelper:
                 log("[+] Desktop Token 加载成功")
                 return True
             if mode == "cookie":
-                log(f"[+] Desktop Cookie 加载成功: {self._describe_cookie_state()}")
+                log(f"[+] Desktop Cookie 加载成功，{self._describe_login_state()}")
                 return True
             log("[-] 桌面端登录态已失效")
             return False
@@ -253,21 +271,23 @@ class YuketangHelper:
             log(f"[-] 加载登录态失败: {e}")
             return False
 
-    def _check_cooldown(self, lesson_id):
+    def _check_cooldown(self, lesson_id, emit_log=True):
         state = self._load_state()
         last = state.get("last_checkin") if isinstance(state, dict) else None
         if not last or str(last.get("lesson_id")) != str(lesson_id):
-            return False
+            return False, ""
         try:
             elapsed = (
                 datetime.now() - datetime.strptime(last["time"], "%Y-%m-%d %H:%M:%S")
             ).total_seconds() / 60
             if elapsed < CHECKIN_COOLDOWN_MINUTES:
-                log(f"[*] 课堂 {lesson_id} 在 {int(elapsed)} 分钟前已签到，跳过")
-                return True
+                message = f"课堂 {lesson_id} 在 {int(elapsed)} 分钟前已签到，跳过"
+                if emit_log:
+                    log(f"[*] {message}")
+                return True, message
         except Exception:
             pass
-        return False
+        return False, ""
 
     def _record_checkin(self, lesson_id):
         state = self._load_state()
@@ -342,12 +362,12 @@ class YuketangHelper:
                     log("[+] 桌面端登录成功，Authorization 已保存")
                     return True
                 if mode == "cookie":
-                    log(f"[+] 桌面端登录成功，Cookie 已保存: {self._describe_cookie_state()}")
+                    log(f"[+] 桌面端登录成功，Cookie 已保存，{self._describe_login_state()}")
                     return True
                 header_keys = ", ".join(sorted(resp.headers.keys()))
                 log(
                     f"[-] 登录成功，但未建立可复用的桌面端登录态；"
-                    f"响应头: {header_keys or '无'}；当前 Cookie: {self._describe_cookie_state()}"
+                    f"响应头: {header_keys or '无'}；当前状态: {self._describe_login_state()}"
                 )
                 return False
 
@@ -360,25 +380,61 @@ class YuketangHelper:
                 last_status = msg
             time.sleep(2)
 
-    def get_active_lesson_data(self):
+    def _fetch_active_lesson_result(self):
         try:
             resp = self._desktop_request("get", "/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
             data = resp.json()
             if data.get("code") != 0:
-                log(f"[-] 获取课堂列表失败: {data.get('msg')}")
-                return None, None
+                return {
+                    "state": "error",
+                    "log_prefix": "[-]",
+                    "message": f"获取课堂列表失败: {data.get('msg')}",
+                    "lesson_id": None,
+                    "classroom_id": None,
+                }
             active = data.get("data", {}).get("onLessonClassrooms", [])
             if not active:
-                return None, None
+                return {
+                    "state": "idle",
+                    "log_prefix": "[-]",
+                    "message": "当前没有正在进行的课堂",
+                    "lesson_id": None,
+                    "classroom_id": None,
+                }
             classroom = active[0]
-            return classroom.get("lessonId"), classroom.get("classroomId")
+            return {
+                "state": "active",
+                "log_prefix": "[*]",
+                "message": f"检测到课堂 {classroom.get('lessonId')}",
+                "lesson_id": classroom.get("lessonId"),
+                "classroom_id": classroom.get("classroomId"),
+            }
         except Exception as e:
-            log(f"[!] 获取课堂列表异常: {e}")
-            return None, None
+            return {
+                "state": "error",
+                "log_prefix": "[!]",
+                "message": f"获取课堂列表异常: {e}",
+                "lesson_id": None,
+                "classroom_id": None,
+            }
 
-    def sign_in(self, lesson_id, classroom_id=None, source=1):
-        if self._check_cooldown(lesson_id):
-            return False
+    def get_active_lesson_data(self):
+        result = self._fetch_active_lesson_result()
+        if result["state"] == "error":
+            log(f"{result['log_prefix']} {result['message']}")
+        if result["state"] != "active":
+            return None, None
+        return result["lesson_id"], result["classroom_id"]
+
+    def _perform_sign_in(self, lesson_id, classroom_id=None, source=1):
+        on_cooldown, cooldown_message = self._check_cooldown(lesson_id, emit_log=False)
+        if on_cooldown:
+            return {
+                "success": False,
+                "state": "cooldown",
+                "log_prefix": "[*]",
+                "message": cooldown_message,
+            }
         payload = {"lessonId": str(lesson_id), "source": source}
         headers = {"Referer": f"{BASE_URL}/v2/web/index"}
         if classroom_id:
@@ -393,22 +449,56 @@ class YuketangHelper:
             )
             data = resp.json()
             if data.get("code") == 0:
-                log(f"[+] 签到成功 (课堂: {lesson_id})")
                 self._record_checkin(lesson_id)
                 self.save_session()
-                return True
-            log(f"[-] 签到失败: {data.get('msg')}")
-            return False
+                return {
+                    "success": True,
+                    "state": "success",
+                    "log_prefix": "[+]",
+                    "message": f"签到成功 (课堂: {lesson_id})",
+                }
+            return {
+                "success": False,
+                "state": "failed",
+                "log_prefix": "[-]",
+                "message": f"签到失败: {data.get('msg')}",
+            }
         except Exception as e:
-            log(f"[!] 签到请求异常: {e}")
-            return False
+            return {
+                "success": False,
+                "state": "error",
+                "log_prefix": "[!]",
+                "message": f"签到请求异常: {e}",
+            }
+
+    def sign_in(self, lesson_id, classroom_id=None, source=1):
+        result = self._perform_sign_in(lesson_id, classroom_id=classroom_id, source=source)
+        log(f"{result['log_prefix']} {result['message']}")
+        return result["success"]
+
+    def auto_sign_once(self, emit_log=True):
+        lesson_result = self._fetch_active_lesson_result()
+        if lesson_result["state"] != "active":
+            if emit_log:
+                log(f"{lesson_result['log_prefix']} {lesson_result['message']}")
+            return lesson_result
+        sign_result = self._perform_sign_in(
+            lesson_result["lesson_id"],
+            classroom_id=lesson_result["classroom_id"],
+        )
+        if emit_log:
+            log(f"{sign_result['log_prefix']} {sign_result['message']}")
+        return sign_result
 
     def keep_alive(self):
         try:
             resp = self._desktop_request("get", "/api/v3/user/basic-info", timeout=10)
             data = resp.json()
             if data.get("code") == 0:
-                log("[+] 会话保活成功")
+                if self.desktop_auth:
+                    log("[+] 会话保活成功，Authorization 已刷新")
+                else:
+                    log(f"[+] 会话保活成功，{self._describe_login_state()}")
                 self.save_session()
                 return True
             log(f"[-] 会话保活失败: {data.get('msg')}")
@@ -416,8 +506,6 @@ class YuketangHelper:
         except Exception as e:
             log(f"[!] 会话保活异常: {e}")
             return False
-
-
 def ensure_login(helper, allow_interactive_login):
     auth = helper.load_session()
     if auth:

@@ -5,6 +5,7 @@
 !README.md
 !yuketang_ws_listener.py
 !yuketang_helper.py
+!yuketang_helper_web.py
 
 # 保留 .gitignore 自身
 !.gitignore
