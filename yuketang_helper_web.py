@@ -634,7 +634,7 @@ class YuketangHelper:
 
     def sign_in(self, lesson_id, classroom_id=None, source=1):
         if self._check_cooldown(lesson_id):
-            return
+            return False
         self._refresh_session_fields()
         payload = {"lessonId": str(lesson_id), "source": source}
         headers = {
@@ -651,10 +651,13 @@ class YuketangHelper:
                 log(f"[+] 签到成功 (课堂: {lesson_id})")
                 self._record_checkin(lesson_id)
                 self.save_session()
+                return True
             else:
                 log(f"[-] 签到失败: {res.get('msg')}")
+                return False
         except Exception as e:
             log(f"[!] 签到请求异常: {e}")
+            return False
 
     def keep_alive(self):
         try:
@@ -713,13 +716,12 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if args.keepalive:
-        helper.keep_alive()
-        sys.exit(0)
+        sys.exit(0 if helper.keep_alive() else 1)
 
     if args.auto:
         lesson_id, classroom_id = helper.get_active_lesson_data()
         if lesson_id:
-            helper.sign_in(lesson_id, classroom_id=classroom_id)
+            sys.exit(0 if helper.sign_in(lesson_id, classroom_id=classroom_id) else 1)
         else:
             log("[-] 当前没有正在进行的课堂")
         sys.exit(0)
