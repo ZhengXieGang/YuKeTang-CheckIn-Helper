@@ -95,13 +95,13 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 | `--cooldown N` | 签到去重冷却时间（分钟，默认 15） |
 | `-s N` / `--schedule N` | 延迟 N 分钟后开始，每分钟检测一次课堂并签到 |
 
-### 动态二维码签到
+~~### 动态二维码签到~~
 
 ~~**测试工具**（独立脚本）：~~
-```bash
+
 ~~python yuketang_ws_listener.py~~
 ~~# 启动后会直接通过 WebSocket 监听动态 ticket，并在拿到后发起签到~~
-```
+
 
 ### Cron 定时任务示例
 
