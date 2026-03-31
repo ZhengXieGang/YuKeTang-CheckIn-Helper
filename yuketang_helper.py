@@ -11,7 +11,7 @@ import requests
 
 # ========== 用户配置 ==========
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
-CHECKIN_COOLDOWN_MINUTES = 30
+CHECKIN_COOLDOWN_MINUTES = 15
 # ==============================
 
 GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -524,8 +524,6 @@ if __name__ == "__main__":
     parser.add_argument("-a", "--auto", action="store_true", help="自动扫描课堂并签到")
     parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("--qr", action="store_true", help="显示桌面端登录二维码")
-    parser.add_argument("-p", "--phone", type=str, help="已弃用，仅为兼容保留")
-    parser.add_argument("-pw", "--password", type=str, help="已弃用，仅为兼容保留")
     parser.add_argument(
         "--cooldown",
         type=int,
@@ -536,9 +534,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
-
-    if args.phone or args.password:
-        log("[*] 当前版本已全面切换到桌面端扫码登录，-p/-pw 参数会被忽略")
 
     helper = YuketangHelper()
     interactive_login_allowed = sys.stdin.isatty() and sys.stdout.isatty()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 雨课堂动态二维码签到测试工具
-支持两种方案：API 越权获取 + WebSocket 监听
+通过 WebSocket 监听动态签到暗号
 """
 import json
 import os
@@ -253,45 +253,11 @@ class YuketangTester:
             log(f"[-] 获取课堂失败: {e}")
             return None
 
-    def try_api_method(self, lesson_id):
-        log("[*] 尝试 API 越权方案...")
-        try:
-            payload = {"lessonId": str(lesson_id), "source": 10}
-            resp = self._desktop_request("post", "/api/v3/lesson/checkin", json=payload, timeout=10).json()
-            if resp.get("code") != 0:
-                log(f"[-] 获取 lessonToken 失败: {resp.get('msg')}")
-                return None
-            lesson_token = resp["data"].get("lessonToken")
-            log("[+] 获取到 lessonToken")
-
-            resp2 = self._desktop_request(
-                "get",
-                "/api/v3/lesson/fetch-dynamic-invitation",
-                params={"v": 2},
-                headers={"Authorization": f"Bearer {lesson_token}"},
-                timeout=10,
-            ).json()
-            if resp2.get("code") != 0:
-                log(f"[-] 获取暗号失败: {resp2.get('msg')}")
-                return None
-
-            qr_content = resp2["data"].get("qrContent", "")
-            ticket_match = re.search(r"ticket=([A-Za-z0-9]+)", qr_content)
-            if ticket_match:
-                ticket = ticket_match.group(1)
-                log(f"[+] 成功获取 ticket: {ticket}")
-                return ticket
-            log("[-] 无法从 qrContent 提取 ticket")
-            return None
-        except Exception as e:
-            log(f"[-] API 方案异常: {e}")
-            return None
-
-    def try_websocket_method(self, lesson_id, timeout=60):
+    def try_websocket_method(self, timeout=60):
         if not HAS_MQTT:
             log("[-] 未安装 paho-mqtt，请运行: pip install paho-mqtt")
             return None
-        log("[*] 尝试 WebSocket 监听方案...")
+        log("[*] 开始 WebSocket 监听...")
         ticket_found = [None]
 
         def on_connect(client, userdata, flags, rc):
@@ -381,27 +347,10 @@ if __name__ == "__main__":
         log("[!] 没有活跃课堂，无法测试")
         sys.exit(1)
 
-    print("\n请选择测试方案:")
-    print("1. API 越权方案 (source=10)")
-    print("2. WebSocket 监听方案")
-    print("3. 两种方案都测试")
-
-    try:
-        choice = input("\n请输入选项 (1/2/3): ").strip()
-    except (KeyboardInterrupt, EOFError):
-        sys.exit(0)
-
-    ticket = None
-    if choice in ["1", "3"]:
-        ticket = tester.try_api_method(lesson_id)
-        if ticket and choice == "1":
-            sys.exit(0 if tester.checkin_with_ticket(lesson_id, ticket) else 1)
-
-    if choice in ["2", "3"] and not ticket:
-        ticket = tester.try_websocket_method(lesson_id, timeout=60)
+    ticket = tester.try_websocket_method(timeout=60)
 
     if ticket:
-        tester.checkin_with_ticket(lesson_id, ticket)
+        sys.exit(0 if tester.checkin_with_ticket(lesson_id, ticket) else 1)
     else:
-        log("[!] 所有方案均未获取到 ticket")
+        log("[!] 未通过 WebSocket 获取到 ticket")
         sys.exit(1)

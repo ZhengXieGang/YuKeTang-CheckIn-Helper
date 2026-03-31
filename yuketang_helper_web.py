@@ -32,13 +32,14 @@ except ImportError:
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
 AUTO_LOGIN_PHONE = ""
 AUTO_LOGIN_PSWD = ""
-CHECKIN_COOLDOWN_MINUTES = 30
+CHECKIN_COOLDOWN_MINUTES = 15
 # ==============================
 
 GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 BASE_URL = f"https://{BASE_DOMAIN}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session_web.json")
+DESKTOP_STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
 BROWSER_SYNC_WAIT_SECONDS = 6
 
 
@@ -59,8 +60,8 @@ def write_json_file(path, data):
         json.dump(data, f, ensure_ascii=False)
 
 
-def load_state_dict():
-    state = read_json_file(STATE_FILE, {})
+def load_state_dict(path=STATE_FILE):
+    state = read_json_file(path, {})
     return state if isinstance(state, dict) else {}
 
 
@@ -108,6 +109,30 @@ def load_browser_state():
     if isinstance(browser_state, dict):
         return browser_state
     return None
+
+
+def extract_cookie_records(raw_state):
+    if isinstance(raw_state, list):
+        return raw_state
+    if not isinstance(raw_state, dict):
+        return []
+
+    cookie_list = raw_state.get("cookies", [])
+    if cookie_list:
+        return cookie_list
+
+    desktop_cookies = raw_state.get("desktop_cookies", [])
+    if desktop_cookies:
+        return desktop_cookies
+
+    if "sessionid" in raw_state:
+        return [
+            {"name": k, "value": v, "domain": BASE_DOMAIN, "path": "/"}
+            for k, v in raw_state.items()
+            if isinstance(v, str)
+        ]
+
+    return []
 
 
 class AutoLogin:
@@ -373,22 +398,24 @@ class YuketangHelper:
             self.session.cookies.set(item["name"], item["value"], **kwargs)
         self._refresh_session_fields()
 
+    def _load_cookie_state_sources(self):
+        sources = [(STATE_FILE, self._load_state())]
+        if os.path.abspath(DESKTOP_STATE_FILE) != os.path.abspath(STATE_FILE):
+            sources.append((DESKTOP_STATE_FILE, load_state_dict(DESKTOP_STATE_FILE)))
+        return sources
+
     def _load_cookies_from_state(self):
-        raw = self._load_state()
-        if isinstance(raw, list):
-            cookie_list = raw
-        elif isinstance(raw, dict):
-            cookie_list = raw.get("cookies", [])
-            if not cookie_list and "sessionid" in raw:
-                cookie_list = [
-                    {"name": k, "value": v, "domain": BASE_DOMAIN, "path": "/"}
-                    for k, v in raw.items()
-                    if isinstance(v, str)
-                ]
-        else:
-            return False
-        self._set_cookie_records(cookie_list, clear=True)
-        return bool(self.session.cookies)
+        for path, raw in self._load_cookie_state_sources():
+            cookie_list = extract_cookie_records(raw)
+            if not cookie_list:
+                continue
+            self._set_cookie_records(cookie_list, clear=True)
+            if self.session.cookies:
+                if os.path.abspath(path) != os.path.abspath(STATE_FILE):
+                    log(f"[*] 已从 {os.path.basename(path)} 导入 Cookie")
+                return True
+        self._set_cookie_records([], clear=True)
+        return False
 
     def _probe_session(self):
         if not self.session.cookies.get("sessionid"):
