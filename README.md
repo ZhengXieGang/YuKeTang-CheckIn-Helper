@@ -6,7 +6,7 @@
 
 - **桌面端扫码登录**：终端内显示桌面端登录二维码，手机扫码即可认证
 - **自动签到**：自动扫描当前正在进行的课堂并完成签到
-- **动态二维码签到测试工具**：独立脚本通过 WebSocket 监听动态暗号并执行签到测试
+- **动态二维码签到测试工具**：~~独立脚本通过 WebSocket 监听动态暗号并执行签到测试~~（确认无效，已删除）
 - **签到去重**：同一课堂在冷却期内（默认 15 分钟）不会重复签到
 - **桌面端登录态持久化**：统一保存在 `yuketang_session.json` 中，自动保存轮转后的 `desktop_auth` 或桌面端 Cookie
 - **会话保活**：定期刷新 Session，防止过期掉线
@@ -97,10 +97,10 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 
 ### 动态二维码签到
 
-**测试工具**（独立脚本）：
+~~**测试工具**（独立脚本）：~~
 ```bash
-python yuketang_ws_listener.py
-# 启动后会直接通过 WebSocket 监听动态 ticket，并在拿到后发起签到
+~~python yuketang_ws_listener.py~~
+~~# 启动后会直接通过 WebSocket 监听动态 ticket，并在拿到后发起签到~~
 ```
 
 ### Cron 定时任务示例
