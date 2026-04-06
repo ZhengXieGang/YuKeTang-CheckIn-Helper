@@ -173,6 +173,23 @@ class YuketangHelper:
             return "Authorization 已加载"
         return "无可用登录态"
 
+    def _describe_login_channels(self):
+        cookie_map = self._get_cookie_map()
+        parts = [f"Authorization={'已加载' if self.desktop_auth else '无'}"]
+        for name in ("sid", "sessionid"):
+            cookie = cookie_map.get(name)
+            if not cookie:
+                parts.append(f"{name}=无")
+                continue
+            expires = cookie.get("expires")
+            expires_text = (
+                datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
+                if expires
+                else "session"
+            )
+            parts.append(f"{name}=有效至 {expires_text}")
+        return "；".join(parts)
+
     def save_session(self):
         state = self._load_state()
         if not isinstance(state, dict):
@@ -260,10 +277,10 @@ class YuketangHelper:
                 return False
             mode = self._probe_login_state()
             if mode == "token":
-                log("[+] Desktop Token 加载成功")
+                log(f"[+] Desktop Token 加载成功，{self._describe_login_channels()}")
                 return True
             if mode == "cookie":
-                log(f"[+] Desktop Cookie 加载成功，{self._describe_login_state()}")
+                log(f"[+] Desktop Cookie 加载成功，{self._describe_login_channels()}")
                 return True
             log("[-] 桌面端登录态已失效")
             return False
@@ -359,15 +376,15 @@ class YuketangHelper:
             if code == 0:
                 mode = self._probe_login_state() or self._bootstrap_login_state_after_login()
                 if mode == "token":
-                    log("[+] 桌面端登录成功，Authorization 已保存")
+                    log(f"[+] 桌面端登录成功，{self._describe_login_channels()}")
                     return True
                 if mode == "cookie":
-                    log(f"[+] 桌面端登录成功，Cookie 已保存，{self._describe_login_state()}")
+                    log(f"[+] 桌面端登录成功，{self._describe_login_channels()}")
                     return True
                 header_keys = ", ".join(sorted(resp.headers.keys()))
                 log(
                     f"[-] 登录成功，但未建立可复用的桌面端登录态；"
-                    f"响应头: {header_keys or '无'}；当前状态: {self._describe_login_state()}"
+                    f"响应头: {header_keys or '无'}；当前状态: {self._describe_login_channels()}"
                 )
                 return False
 
@@ -495,10 +512,7 @@ class YuketangHelper:
             resp = self._desktop_request("get", "/api/v3/user/basic-info", timeout=10)
             data = resp.json()
             if data.get("code") == 0:
-                if self.desktop_auth:
-                    log("[+] 会话保活成功，Authorization 已刷新")
-                else:
-                    log(f"[+] 会话保活成功，{self._describe_login_state()}")
+                log(f"[+] 会话保活成功，{self._describe_login_channels()}")
                 self.save_session()
                 return True
             log(f"[-] 会话保活失败: {data.get('msg')}")
