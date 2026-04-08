@@ -1,67 +1,56 @@
 # 雨课堂自动签到助手
 
-长江雨课堂自动签到工具。默认主脚本现已全面切换为桌面端二维码登录；如果你仍然需要原来的 `ddddocr + playwright` 账密登录流程，也保留了独立的旧版 Web 脚本。两套脚本都可以配合 Cron 定时任务使用。
+长江雨课堂全自动签到工具，支持账号密码自动登录（含验证码破解）和微信扫码登录，适配 Cron 定时任务实现 24/7 无人值守。
 
 ## 功能和特性
 
-- **桌面端扫码登录**：终端内显示桌面端登录二维码，手机扫码即可认证
+- **全自动账密登录**：基于 Playwright + ddddocr 实现无头浏览器自动登录，自动识别并通过腾讯天御人机验证（汉字点选 / 滑块拼图）
+- **微信扫码登录**：终端内显示二维码，手机扫码即可完成认证
 - **自动签到**：自动扫描当前正在进行的课堂并完成签到
-- **动态二维码签到测试工具**：~~独立脚本通过 WebSocket 监听动态暗号并执行签到测试~~（确认无效，已删除）
 - **签到去重**：同一课堂在冷却期内（默认 15 分钟）不会重复签到
-- **桌面端登录态持久化**：统一保存在 `yuketang_session.json` 中，自动保存轮转后的 `desktop_auth` 或桌面端 Cookie
 - **会话保活**：定期刷新 Session，防止过期掉线
-- **主脚本单状态文件**：桌面端主脚本始终只使用一个 `yuketang_session.json`
+- **动态码签到（测试）**：独立测试脚本 `test_checkin_bypass.py` 可自动探测多种签到路径
 
 ## 环境要求
-
-### 运行依赖
-
+`yuketang_helper.py`：
 ```bash
 pip install requests qrcode
 ```
-
-### 动态二维码签到（可选）
-
-```bash
-pip install paho-mqtt
-```
-
-### 旧版 Web 账密登录（可选）
-
-如果你还需要原来的 `ddddocr + playwright` 账密登录流程，现在保留为独立脚本：
-
+`yuketang_helper_web.py`：
 ```bash
 pip install requests qrcode ddddocr playwright Pillow
 playwright install chromium
-python yuketang_helper_web.py -a -p [手机号] -pw [密码]
 ```
-
-这个独立版本使用 `yuketang_session_web.json` 保存自己的 Cookie 和浏览器状态，避免和当前桌面端版本互相覆盖。
 
 ## 使用方法
 
-### 基础用法（建议使用支持 UTF-8 的终端，以免二维码显示异常）
+### 基础用法（建议使用支持 UTF-8 的终端）
 
 ```bash
-# 桌面端主脚本：自动加载桌面端登录态 + 自动签到
+# 首次使用（自动登录 + 签到）
 python yuketang_helper.py -a
 
-# 桌面端主脚本：强制重新扫码登录
+# 强制扫码登录
 python yuketang_helper.py --qr
 
-# 桌面端主脚本：交互模式
+# 交互模式
 python yuketang_helper.py
 
-# 旧版 Web 账密登录版本
-python yuketang_helper_web.py -a -p [手机号] -pw [密码]
+# 定时签到（延迟 5 分钟后开始，每 60 秒检测一次）
+python yuketang_helper.py -s 5
+
+# 会话保活
+python yuketang_helper.py -k
 ```
 
-### 脚本区分
+### 签到突破测试
 
-- `yuketang_helper.py`：当前主脚本，使用桌面端二维码登录，状态文件为 `yuketang_session.json`
-- `yuketang_helper_web.py`：旧版 Web 账密登录脚本，基于 `ddddocr + playwright`，状态文件为 `yuketang_session_web.json`
+```bash
+# 自动测试所有签到路径，输出报告
+python test_checkin_bypass.py
+```
 
-如果你只是想稳定长期保活，优先使用 `yuketang_helper.py`；如果你就是要恢复原来的账密自动登录流程，再使用 `yuketang_helper_web.py`。
+测试脚本会自动从 `yuketang_session.json` 读取 Cookie，**不会修改 session 文件**，测试完成后输出结构化报告标明每种方法的可用性。
 
 ### 域名配置
 
@@ -73,7 +62,7 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 # BASE_DOMAIN = "yuketang.cn"           # 雨课堂
 ```
 
-### `yuketang_helper.py` 命令行参数
+### 命令行参数
 
 | 参数 | 说明 |
 |------|------|
@@ -83,33 +72,13 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 | `--cooldown N` | 签到去重冷却时间（分钟，默认 15） |
 | `-s N` / `--schedule N` | 延迟 N 分钟后开始，每分钟检测一次课堂并签到 |
 
-### `yuketang_helper_web.py` 命令行参数
-
-| 参数 | 说明 |
-|------|------|
-| `-a` / `--auto` | 自动扫描课堂并签到 |
-| `-k` / `--keepalive` | 仅执行会话保活 |
-| `-p` / `--phone` | 手机号（覆盖脚本内置配置） |
-| `-pw` / `--password` | 密码（覆盖脚本内置配置） |
-| `--qr` | 强制改用扫码登录 |
-| `--cooldown N` | 签到去重冷却时间（分钟，默认 15） |
-| `-s N` / `--schedule N` | 延迟 N 分钟后开始，每分钟检测一次课堂并签到 |
-
-~~### 动态二维码签到~~
-
-~~**测试工具**（独立脚本）：~~
-
-~~python yuketang_ws_listener.py~~
-~~# 启动后会直接通过 WebSocket 监听动态 ticket，并在拿到后发起签到~~
-
-
 ### Cron 定时任务示例
 
 ```bash
 # 每4小时保活一次
 0 */4 * * * cd /path/to/yuketang && python yuketang_helper.py -k >> cron.log 2>&1
 
-# 工作日上课时段自动签到
+# 工作日上课时段自动签到（仅供参考）
 50 7,13,18 * * 1-5 cd /path/to/yuketang && python yuketang_helper.py -a >> cron.log 2>&1
 0 10,16 * * 1-5 cd /path/to/yuketang && python yuketang_helper.py -a >> cron.log 2>&1
 ```
@@ -118,17 +87,15 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 
 | 文件 | 说明 |
 |------|------|
-| `yuketang_helper.py` | 主程序，包含桌面端扫码登录、签到、保活 |
-| `yuketang_helper_web.py` | 旧版 Web 账密登录脚本，基于 `ddddocr + playwright` |
-| `yuketang_ws_listener.py` | 动态二维码测试工具（独立脚本） |
-| `yuketang_session.json` | 持久化状态文件（`desktop_auth` / `desktop_cookies` + 签到记录），自动生成 |
-| `yuketang_session_web.json` | 旧版 Web 脚本的独立状态文件（Cookie + browser_state + 签到记录），自动生成 |
-| `yuketang_technical_handover.md` | 技术移交文档，包含逆向分析过程 |
+| `yuketang_helper.py` | 主程序，负责签到、保活、用户交互 |
+| `auto_login_hack.py` | 自动化登录引擎，通过 Playwright 破解验证码获取 Session |
+| `yuketang_session.json` | 持久化状态文件（Cookie + 签到记录），自动生成 |
 
 ## 签到去重机制
 
-两个脚本都会在各自的状态文件中记录每次成功签到的课堂号和时间。再次对同一课堂签到时，如果距上次不超过冷却时间（默认 15 分钟），则自动跳过。
+每次成功签到后会在 `yuketang_session.json` 中记录课堂号和时间。再次对同一课堂签到时，如果距上次不超过冷却时间（默认 15 分钟），则自动跳过。
 
+可通过 `--cooldown` 参数自定义冷却时间：
 ```bash
 python yuketang_helper.py -a --cooldown 60  # 60 分钟内不重复签到
 ```

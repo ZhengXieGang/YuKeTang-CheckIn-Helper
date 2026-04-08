@@ -70,7 +70,6 @@ class YuketangHelper:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": GLOBAL_UA})
-        self.desktop_auth = None
 
     def _load_state(self):
         return load_state_dict()
@@ -78,28 +77,7 @@ class YuketangHelper:
     def _save_state(self, state):
         write_json_file(STATE_FILE, state)
 
-    def _set_desktop_auth(self, auth):
-        if isinstance(auth, str) and auth.startswith("Bearer "):
-            auth = auth.split(" ", 1)[1].strip()
-        self.desktop_auth = auth.strip() if isinstance(auth, str) and auth.strip() else None
-        if self.desktop_auth:
-            self.session.headers["Authorization"] = f"Bearer {self.desktop_auth}"
-        else:
-            self.session.headers.pop("Authorization", None)
 
-    def _try_extract_auth_from_response(self, resp):
-        candidates = []
-        if resp is not None:
-            candidates.append(resp)
-            candidates.extend(getattr(resp, "history", []) or [])
-        for item in candidates:
-            headers = getattr(item, "headers", {}) or {}
-            for key in ("set-auth", "Set-Auth", "authorization", "Authorization"):
-                value = headers.get(key)
-                if isinstance(value, str) and value.strip():
-                    self._set_desktop_auth(value)
-                    return True
-        return False
 
     def _cookie_records_from_jar(self):
         records = []
@@ -169,65 +147,35 @@ class YuketangHelper:
                 else "session"
             )
             return f"{name} 有效至 {expires_text}"
-        if self.desktop_auth:
-            return "Authorization 已加载"
         return "无可用登录态"
-
-    def _describe_login_channels(self):
-        cookie_map = self._get_cookie_map()
-        parts = [f"Authorization={'已加载' if self.desktop_auth else '无'}"]
-        for name in ("sid", "sessionid"):
-            cookie = cookie_map.get(name)
-            if not cookie:
-                parts.append(f"{name}=无")
-                continue
-            expires = cookie.get("expires")
-            expires_text = (
-                datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
-                if expires
-                else "session"
-            )
-            parts.append(f"{name}=有效至 {expires_text}")
-        return "；".join(parts)
 
     def save_session(self):
         state = self._load_state()
         if not isinstance(state, dict):
             state = {}
-        for legacy_key in ("cookies", "browser_state", "sessionid", "csrftoken"):
+        for legacy_key in ("cookies", "browser_state", "sessionid", "csrftoken",
+                          "desktop_auth", "desktop_auth_updated_at"):
             state.pop(legacy_key, None)
-        if self.desktop_auth:
-            state["desktop_auth"] = self.desktop_auth
-            state["desktop_auth_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            state.pop("desktop_auth", None)
-            state.pop("desktop_auth_updated_at", None)
         cookie_records = self._cookie_records_from_jar()
         if cookie_records:
+            # 只有 jar 中有 Cookie 时才更新，防止意外清空
             state["desktop_cookies"] = cookie_records
             state["desktop_cookies_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            state.pop("desktop_cookies", None)
-            state.pop("desktop_cookies_updated_at", None)
+        # 如果 jar 为空，保留文件中原有的 Cookie 数据不动
         self._save_state(state)
 
     def _desktop_request(self, method, path, timeout=20, headers=None, **kwargs):
-        old_auth = self.desktop_auth
         old_cookie_signature = self._cookie_signature()
         req_headers = {
             "User-Agent": GLOBAL_UA,
             "Content-Type": "application/json",
             **DESKTOP_HEADERS,
         }
-        if self.desktop_auth:
-            req_headers["Authorization"] = f"Bearer {self.desktop_auth}"
         if headers:
             req_headers.update(headers)
         url = path if path.startswith("http") else f"{BASE_URL}{path}"
         resp = self.session.request(method, url, headers=req_headers, timeout=timeout, **kwargs)
-        if self._try_extract_auth_from_response(resp):
-            pass
-        if self.desktop_auth != old_auth or self._cookie_signature() != old_cookie_signature:
+        if self._cookie_signature() != old_cookie_signature:
             self.save_session()
         return resp
 
@@ -239,10 +187,7 @@ class YuketangHelper:
             data = resp.json()
             if data.get("code") == 0:
                 self.save_session()
-                if self.desktop_auth:
-                    return "token"
-                if self.session.cookies:
-                    return "cookie"
+                return "cookie"
         except Exception:
             return None
         return None
@@ -260,10 +205,7 @@ class YuketangHelper:
                 data = resp.json()
                 if data.get("code") == 0:
                     self.save_session()
-                    if self.desktop_auth:
-                        return "token"
-                    if self.session.cookies:
-                        return "cookie"
+                    return "cookie"
             except Exception:
                 continue
         return None
@@ -271,16 +213,12 @@ class YuketangHelper:
     def load_session(self):
         try:
             state = self._load_state()
-            self._set_desktop_auth(state.get("desktop_auth"))
             self._set_cookie_records(state.get("desktop_cookies", []), clear=True)
-            if not self.desktop_auth and not self.session.cookies:
+            if not self.session.cookies:
                 return False
             mode = self._probe_login_state()
-            if mode == "token":
-                log(f"[+] Desktop Token 加载成功，{self._describe_login_channels()}")
-                return True
             if mode == "cookie":
-                log(f"[+] Desktop Cookie 加载成功，{self._describe_login_channels()}")
+                log(f"[+] Cookie 加载成功，{self._describe_login_state()}")
                 return True
             log("[-] 桌面端登录态已失效")
             return False
@@ -375,16 +313,13 @@ class YuketangHelper:
             msg = data.get("msg") or data.get("message") or f"code={code}"
             if code == 0:
                 mode = self._probe_login_state() or self._bootstrap_login_state_after_login()
-                if mode == "token":
-                    log(f"[+] 桌面端登录成功，{self._describe_login_channels()}")
-                    return True
                 if mode == "cookie":
-                    log(f"[+] 桌面端登录成功，{self._describe_login_channels()}")
+                    log(f"[+] 桌面端登录成功，{self._describe_login_state()}")
                     return True
                 header_keys = ", ".join(sorted(resp.headers.keys()))
                 log(
-                    f"[-] 登录成功，但未建立可复用的桌面端登录态；"
-                    f"响应头: {header_keys or '无'}；当前状态: {self._describe_login_channels()}"
+                    f"[-] 登录成功，但未建立可复用的登录态；"
+                    f"响应头: {header_keys or '无'}；当前状态: {self._describe_login_state()}"
                 )
                 return False
 
@@ -512,7 +447,7 @@ class YuketangHelper:
             resp = self._desktop_request("get", "/api/v3/user/basic-info", timeout=10)
             data = resp.json()
             if data.get("code") == 0:
-                log(f"[+] 会话保活成功，{self._describe_login_channels()}")
+                log(f"[+] 会话保活成功，{self._describe_login_state()}")
                 self.save_session()
                 return True
             log(f"[-] 会话保活失败: {data.get('msg')}")
