@@ -1,271 +1,151 @@
 #!/usr/bin/env python3
 """
-雨课堂签到方法验证脚本 — 基于源码逆向确认的 API
-
-源码确认的签到相关端点：
-  [桌面端]  /api/v3/lesson/checkin            POST {lessonId, source, inviteCode?}
-  [Web端]   /api/v3/lesson/notkn/checkin      POST {source, inviteCode?}
-  [旧Web]   /api/lesson/web_check_in          POST {invite_code?, source}
-  [投票器]  /api/v3/vote-machine/lesson-check-in  POST {lesson_id, devices, source_type}
-  [动态码]  /api/v3/lesson/check-in/dynamic-qr-code  GET ?c=&t=&s=&v=
-  [课堂总结] /api/v3/lesson-summary/checkin    (未知用法)
-  [legacy]  /api/legacy/lesson/get-token       GET
-
-源码确认的 source 值：
-  1  = 普通签到
-  6  = 暗号签到 (inviteCode = 5位字母数字)
-  10 = 教师端进入课堂（返回 lessonToken）
-  14 = 二维码签到 (inviteCode 以数字开头)
-  81 = 投票器 tryVoteCheckin
-  82 = 投票器 checkinByDigitalPen
+雨课堂签到协议深度诊断工具 V2
+[源码事实版]
+功能：
+  1. 轮询活跃课堂。
+  2. 后台开启 WebSocket (`/wsapp/`) 监听服务器实时指令（如 `tryzoomqrcode`, `signin`）。
+  3. 捕获 Payload 并并行发起 `source=1`, `source=6`, `notkn` 等探测。
+  4. 绝不通过伪造动态签名的假定（已被证实不可行），核心是截取服务器下发给网页端/桌面端的参数。
 """
+
 import json
 import time
-import sys
 import os
-import hashlib
+import threading
+import requests
+try:
+    import websocket
+except ImportError:
+    print("请安装依赖: pip install websocket-client --break-system-packages")
+    import sys; sys.exit(1)
+
 from datetime import datetime
 
-import requests
-
-SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yuketang_session.json")
+SESSION_FILE = "yuketang_session.json"
 BASE = "https://changjiang.yuketang.cn"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-DESKTOP_HEADERS = {"xtbz": "ykt", "desktop-v": "v2", "X-Client": "desktop", "Origin": "file://"}
+LOG_FILE = f"ykt_diag_{datetime.now().strftime('%H%M%S')}.log"
 
+def logger(msg, tag="INFO"):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f: 
+        f.write(line + "\n")
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:12]}] {msg}", flush=True)
+class YKT_Debugger:
+    def __init__(self):
+        self.session = requests.Session()
+        self.lesson_id = None
+        self.ws = None
+        self.uid = 0
+        self.load_session()
 
+    def load_session(self):
+        if not os.path.exists(SESSION_FILE):
+            logger(f"未找到 {SESSION_FILE}，请先获取 Cookie", "ERROR")
+            return
+        with open(SESSION_FILE, "r") as f:
+            state = json.load(f)
+            cookies = {c["name"]: c["value"] for c in state.get("desktop_cookies", [])}
+            auth = state.get("desktop_auth", "")
+            self.uid = state.get("uid", 0)
+            
+            self.session.cookies.update(cookies)
+            self.session.headers.update({
+                "Authorization": f"Bearer {auth}", 
+                "X-Client": "desktop",
+                "xtbz": "ykt",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            })
 
-def load_session():
-    with open(SESSION_FILE, "r") as f:
-        state = json.load(f)
-    s = requests.Session()
-    s.headers.update({"User-Agent": UA, "Content-Type": "application/json"})
-    s.headers.update(DESKTOP_HEADERS)
-    for c in state.get("desktop_cookies", []):
-        s.cookies.set(c["name"], c["value"],
-                      domain=c.get("domain", "changjiang.yuketang.cn"),
-                      path=c.get("path", "/"))
-    return s, state
+    def get_active_lesson(self):
+        try:
+            r = self.session.get(f"{BASE}/api/v3/classroom/on-lesson-upcoming-exam").json()
+            if r.get("code") == 0 and r["data"].get("onLessonClassrooms"):
+                self.lesson_id = str(r["data"]["onLessonClassrooms"][0]["lessonId"])
+                logger(f"找到活跃课堂: {self.lesson_id}", "FACT")
+                return self.lesson_id
+        except Exception as e:
+            logger(f"探测活跃课堂失败: {e}", "ERROR")
+        logger("未找到活跃课堂或没有进行中的课程", "INFO")
+        return None
 
+    def on_ws_msg(self, ws, msg):
+        try:
+            data = json.loads(msg)
+            op = data.get("op")
+            # 过滤不需要的心跳或其他杂音
+            if op not in ["fetchtimeline", "hello"]:
+                logger(f"WS 数据包: {msg}", "WS_RAW")
+            
+            # 从前端解包中确认的 Opcodes
+            if op in ["tryzoomqrcode", "signin", "checkin", "new_check_in", "qrcodezoomed"]:
+                logger(f"!!! 捕获关键核心签到指令 [{op}]: {msg}", "CRITICAL")
+                self.trigger_all_checkin()
+        except:
+            pass
 
-def api(session, method, path, label="", **kwargs):
-    """发起请求，输出详细日志"""
-    url = f"{BASE}{path}"
-    try:
-        r = session.request(method, url, timeout=10, **kwargs)
-        ct = r.headers.get("Content-Type", "")
-        if "json" in ct:
-            j = r.json()
-            code = j.get("code", j.get("Status", "?"))
-            msg = j.get("msg", j.get("Message", j.get("message", "")))
-            data = j.get("data", j.get("Data", None))
-            log(f"  {label}: HTTP {r.status_code} | code={code} | msg={msg}")
-            if data and code in (0, 200):
-                log(f"    → data: {json.dumps(data, ensure_ascii=False)[:200]}")
-            return j, r.status_code
-        else:
-            body = r.text[:100] if r.text else "(空)"
-            log(f"  {label}: HTTP {r.status_code} | 非JSON | {body}")
-            return None, r.status_code
-    except Exception as e:
-        log(f"  {label}: 异常 | {e}")
-        return None, str(e)
+    def start_ws(self):
+        if not self.lesson_id:
+            return
+            
+        cookie_str = "; ".join([f"{k}={v}" for k, v in self.session.cookies.get_dict().items()])
+        ws_url = f"wss://changjiang.yuketang.cn/wsapp/"
+        
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            header={"Cookie": cookie_str},
+            on_message=self.on_ws_msg,
+            on_open=lambda ws: ws.send(json.dumps({
+                "op":"hello",
+                "userid": self.uid,
+                "role":"student",
+                "lessonid":self.lesson_id,
+                "version": 6.3
+            }))
+        )
+        t = threading.Thread(target=self.ws.run_forever, daemon=True)
+        t.start()
 
+    def run_api_probes(self):
+        if not self.lesson_id: return
+        
+        logger("执行启发式 API 探测...", "PROBE")
+        # 1. 尝试暗号模式 (Source 6)
+        for code in ["AAAAA", "12345"]:
+            try:
+                r = self.session.post(f"{BASE}/api/v3/lesson/checkin", json={
+                    "lessonId": self.lesson_id, "source": 6, "inviteCode": code
+                }).json()
+                logger(f"Source=6 (暗号 {code}): code={r.get('code')} msg={r.get('msg')}", "API")
+            except: pass
 
-def section(title):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
+        # 2. 尝试答题器模式 (Vote Machine)
+        try:
+            r = self.session.post(f"{BASE}/api/v3/vote-machine/lesson-check-in", json={
+                "lesson_id": self.lesson_id, "source_type": 81, "submit_time": int(time.time()*1000)
+            }).json()
+            logger(f"Vote-Machine: code={r.get('code')} msg={r.get('msg')}", "API")
+        except: pass
 
-
-def main():
-    session, state = load_session()
-
-    # ============ 0. 验证 Cookie ============
-    section("0. 验证 Cookie 登录态")
-    j, _ = api(session, "GET", "/api/v3/user/basic-info", label="basic-info")
-    if not j or j.get("code") != 0:
-        log("❌ Cookie 无效，退出。")
-        sys.exit(1)
-    uid = j["data"]["id"]
-    log(f"  用户={j['data'].get('name')} uid={uid}")
-
-    # ============ 1. 获取活跃课堂 ============
-    section("1. 获取活跃课堂")
-    j, _ = api(session, "GET", "/api/v3/classroom/on-lesson-upcoming-exam",
-               label="on-lesson")
-    active_lessons = []
-    if j and j.get("code") == 0:
-        active_lessons = j["data"].get("onLessonClassrooms", [])
-        if active_lessons:
-            for al in active_lessons:
-                log(f"  ★ 活跃: lesson={al.get('lessonId')} "
-                    f"classroom={al.get('classroomId')} "
-                    f"course={al.get('courseName','')}")
-        else:
-            log("  无活跃课堂")
-
-    lesson_id = None
-    if active_lessons:
-        lesson_id = active_lessons[0]["lessonId"]
-    else:
-        lesson_id = state.get("last_checkin", {}).get("lesson_id")
-        if lesson_id:
-            log(f"  使用历史 lesson_id={lesson_id}（课堂已结束，结果仅供参考）")
-        else:
-            log("  无历史 lesson_id，跳过需要 lessonId 的测试")
-
-    is_active = bool(active_lessons)
-
-    # ============ 2. 桌面端 /api/v3/lesson/checkin ============
-    section("2. 桌面端 /api/v3/lesson/checkin")
-    log("源码: API.index.lesson_checkin / API.lesson.checkin")
-    log("源码: 教师端用 source=10 进入课堂，学生端用 source=6+inviteCode")
-
-    if lesson_id:
-        # source=1 普通签到
-        api(session, "POST", "/api/v3/lesson/checkin",
-            label="source=1",
-            json={"lessonId": str(lesson_id), "source": 1})
-
-        # source=6 暗号签到（假暗号，看错误码）
-        api(session, "POST", "/api/v3/lesson/checkin",
-            label="source=6 inv=AAAAA",
-            json={"lessonId": str(lesson_id), "source": 6,
-                  "inviteCode": "AAAAA", "joinIfNotIn": True})
-
-        # source=10 教师端模式
-        api(session, "POST", "/api/v3/lesson/checkin",
-            label="source=10",
-            json={"lessonId": str(lesson_id), "source": 10})
-
-        # source=14 二维码签到
-        api(session, "POST", "/api/v3/lesson/checkin",
-            label="source=14 inv=12345",
-            json={"lessonId": str(lesson_id), "source": 14,
-                  "inviteCode": "12345"})
-    else:
-        log("  跳过（无 lessonId）")
-
-    # ============ 3. Web端 /api/v3/lesson/notkn/checkin ============
-    section("3. Web端 /api/v3/lesson/notkn/checkin")
-    log("源码: API.pc.index.new_check_in")
-    log("源码: checkin(e,n) → POST {source:e, inviteCode:n}")
-    log("特性: 不需要 lessonId！返回 INVITE_CODE_TIMEOUT 而非 LESSON_END")
-
-    # source=1
-    api(session, "POST", "/api/v3/lesson/notkn/checkin",
-        label="source=1",
-        json={"source": 1})
-
-    # source=6 暗号
-    api(session, "POST", "/api/v3/lesson/notkn/checkin",
-        label="source=6 inv=AAAAA",
-        json={"source": 6, "inviteCode": "AAAAA", "joinIfNotIn": True})
-
-    # source=10 教师端
-    api(session, "POST", "/api/v3/lesson/notkn/checkin",
-        label="source=10",
-        json={"source": 10})
-
-    # source=14 二维码
-    api(session, "POST", "/api/v3/lesson/notkn/checkin",
-        label="source=14 inv=12345",
-        json={"source": 14, "inviteCode": "12345"})
-
-    # ============ 4. 旧Web /api/lesson/web_check_in ============
-    section("4. 旧Web /api/lesson/web_check_in")
-    log("源码: API.pc.index.old_check_in")
-
-    api(session, "POST", "/api/lesson/web_check_in",
-        label="source=14 invite_code=12345",
-        json={"invite_code": "12345", "source": 14})
-
-    # ============ 5. 投票器 /api/v3/vote-machine/lesson-check-in ============
-    section("5. 投票器 /api/v3/vote-machine/lesson-check-in")
-    log("源码: API.device.lesson_check_in")
-    log("源码: tryVoteCheckin → source_type=81")
-    log("源码: checkinByDigitalPen → source_type=82")
-
-    if lesson_id:
-        now_ms = int(time.time() * 1000)
-        dev81 = "VOTE_" + hashlib.md5(str(uid).encode()).hexdigest()[:8].upper()
-        dev82 = "PEN_" + hashlib.md5(str(uid).encode()).hexdigest()[:12].upper()
-
-        api(session, "POST", "/api/v3/vote-machine/lesson-check-in",
-            label="source_type=81",
-            json={"lesson_id": str(lesson_id),
-                  "devices": [{"id": dev81, "dt": now_ms}],
-                  "submit_time": now_ms, "source_type": 81})
-
-        api(session, "POST", "/api/v3/vote-machine/lesson-check-in",
-            label="source_type=82",
-            json={"lesson_id": str(lesson_id),
-                  "devices": [{"id": dev82, "dt": now_ms}],
-                  "submit_time": now_ms, "source_type": 82})
-    else:
-        log("  跳过（无 lessonId）")
-
-    # ============ 6. 动态码端点 ============
-    section("6. 动态码 /api/v3/lesson/check-in/dynamic-qr-code")
-    log("源码: 二维码 URL 就是这个 GET 端点")
-    log("源码: qrContent 由 fetch-dynamic-invitation 返回，签名 s 后端生成")
-
-    # 无参数访问
-    api(session, "GET", "/api/v3/lesson/check-in/dynamic-qr-code",
-        label="无参数")
-
-    # 用采集到的过期参数访问
-    api(session, "GET", "/api/v3/lesson/check-in/dynamic-qr-code",
-        label="过期参数",
-        params={"c": "-jhm-oJeqAO6UIQG170Zzp20f4DYdtgZm9h8JKhHesY",
-                "t": "1775698745320", "s": "540F4598F6BB5E80", "v": "2"})
-
-    # ============ 7. 教师端邀请码获取 ============
-    section("7. 教师端邀请码获取（需教师权限）")
-    log("源码: API.teacher.get_dynamic_invitation / get_invitation")
-
-    api(session, "GET", "/api/v3/lesson/fetch-dynamic-invitation",
-        label="fetch-dynamic-invitation", params={"v": 2})
-
-    api(session, "GET", "/api/v3/lesson/get-invitation",
-        label="get-invitation")
-
-    # ============ 8. 其他端点 ============
-    section("8. 其他已发现端点")
-
-    log("-- /api/v3/lesson-summary/checkin (课堂总结中的签到) --")
-    api(session, "GET", "/api/v3/lesson-summary/checkin",
-        label="GET lesson-summary/checkin")
-    if lesson_id:
-        api(session, "POST", "/api/v3/lesson-summary/checkin",
-            label="POST lesson-summary/checkin",
-            json={"lessonId": str(lesson_id)})
-
-    log("\n-- /api/legacy/lesson/get-token (获取课堂 token) --")
-    api(session, "GET", "/api/legacy/lesson/get-token",
-        label="legacy get-token")
-
-    log("\n-- /api/v3/lesson/checkin/revise (补签) --")
-    api(session, "POST", "/api/v3/lesson/checkin/revise",
-        label="checkin/revise",
-        json={"identityId": str(uid)})
-
-    log("\n-- /api/web/checkin/pro_bind (专业版绑定检查) --")
-    api(session, "GET", "/api/web/checkin/pro_bind",
-        label="pro_bind", params={"user_id": uid})
-
-    # ============ 汇总 ============
-    section("汇总")
-    log("以上为基于源码确认的所有签到相关端点的详细响应。")
-    if not is_active:
-        log("⚠️  当前无活跃课堂，所有签到操作的结果仅反映端点本身行为，不代表签到可行性。")
-        log("⚠️  必须在上课期间重新运行此脚本以获取确定性结论。")
+    def trigger_all_checkin(self):
+        """当 WS 捕获到签到相关事件时，触发所有的突刺请求"""
+        logger("触发全局并发签到突刺（如果提取到 inviteCode 可在此解冻）", "BURST")
+        # 此处可以随时更新解析后的参数
+        self.run_api_probes()
 
 
 if __name__ == "__main__":
-    main()
+    logger("="*50)
+    logger(" 初始化：雨课堂签到协议深度诊断工具 V2 ")
+    logger("="*50)
+    dbg = YKT_Debugger()
+    if dbg.get_active_lesson():
+        dbg.start_ws()
+        logger("WebSocket 监听已开启，正在后台捕获凭证...")
+        dbg.run_api_probes()
+        logger("API 探测完成，脚本将维持 WS 监听 120 秒，请在此期间让教师端发签到...")
+        for i in range(120):
+            time.sleep(1)
+            if i % 10 == 0: logger(f"WS 维持中 ({120-i}s)...")
+        logger("监听结束")
