@@ -39,6 +39,7 @@ class YKT_Debugger:
         self.ws = None
         self.uid = 0
         self.load_session()
+        self.fetch_basic_info()
 
     def load_session(self):
         if not os.path.exists(SESSION_FILE):
@@ -46,17 +47,35 @@ class YKT_Debugger:
             return
         with open(SESSION_FILE, "r") as f:
             state = json.load(f)
-            cookies = {c["name"]: c["value"] for c in state.get("desktop_cookies", [])}
             auth = state.get("desktop_auth", "")
             self.uid = state.get("uid", 0)
             
-            self.session.cookies.update(cookies)
+            for c in state.get("desktop_cookies", []):
+                self.session.cookies.set(
+                    c["name"], 
+                    c["value"], 
+                    domain=c.get("domain", "changjiang.yuketang.cn"), 
+                    path=c.get("path", "/")
+                )
+
             self.session.headers.update({
                 "Authorization": f"Bearer {auth}", 
                 "X-Client": "desktop",
                 "xtbz": "ykt",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
             })
+
+
+    def fetch_basic_info(self):
+        try:
+            r = self.session.get(f"{BASE}/api/v3/user/basic-info").json()
+            if r.get("code") == 0:
+                self.uid = r["data"].get("id", 0)
+                logger(f"获取 UID 成功: {self.uid}", "INFO")
+            else:
+                logger(f"获取 UID 失败 (Cookie 可能过期): {r}", "ERROR")
+        except Exception as e:
+            logger(f"获取基本信息异常: {e}", "ERROR")
 
     def get_active_lesson(self):
         try:
