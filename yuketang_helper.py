@@ -11,7 +11,7 @@ import requests
 
 # ========== 用户配置 ==========
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
-CHECKIN_COOLDOWN_MINUTES = 15           # 签到冷却时长
+CHECKIN_COOLDOWN_MINUTES = 15           # 签到冷却时长 （分钟）
 SCHEDULE_INTERVAL_SECONDS = 20          # 持续检测间隔（秒）
 SCHEDULE_TIMEOUT_MINUTES = 30           # 首轮超时时间（分钟）
 SCHEDULE_EXTENSION_MINUTES = 15         # 每次超时后追加等待时间（分钟）
@@ -19,7 +19,7 @@ SCHEDULE_EXTENSION_MINUTES = 15         # 每次超时后追加等待时间（�
 PUSHPLUS_TOKEN = ""                     # 留空则关闭推送
 PUSHPLUS_CHANNEL = "wechat"             # wechat / mail / webhook / cp / sms
 PUSHPLUS_TEMPLATE = "txt"
-PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
+PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {success_time}"
 PUSHPLUS_CONTENT_TEMPLATE = (
     "签到成功\n"
     "模式：{backend}\n"
