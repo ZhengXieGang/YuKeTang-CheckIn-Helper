@@ -9,6 +9,8 @@
 - **自动签到**：自动扫描当前正在进行的课堂并完成签到
 - **签到去重**：同一课堂在冷却期内（默认 15 分钟）不会重复签到
 - **会话保活**：定期刷新 Session，防止过期掉线
+- **成功推送**：签到成功后可通过 PushPlus 推送提醒
+- **持续重试**：启动后持续运行；到达超时点自动追加等待时间，直到签到成功
 - **动态码签到（测试）**：独立测试脚本 `test_checkin_bypass.py` 可自动探测多种签到路径
 
 ## 环境要求
@@ -62,34 +64,57 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 # BASE_DOMAIN = "yuketang.cn"           # 雨课堂
 ```
 
+### 推送与持续重试配置
+
+在 `yuketang_helper.py` / `yuketang_helper_web.py` 顶部可直接修改：
+
+```python
+SCHEDULE_INTERVAL_SECONDS = 60
+SCHEDULE_TIMEOUT_MINUTES = 30
+SCHEDULE_EXTENSION_MINUTES = 15
+
+PUSHPLUS_TOKEN = ""
+PUSHPLUS_CHANNEL = "wechat"
+PUSHPLUS_TEMPLATE = "txt"
+PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
+PUSHPLUS_CONTENT_TEMPLATE = (
+    "签到成功\n"
+    "模式：{backend}\n"
+    "课堂：{lesson_id}\n"
+    "时间：{success_time}"
+)
+```
+
 ### 命令行参数
 
 | 参数 | 说明 |
 |------|------|
-| `-a` / `--auto` | 自动扫描课堂并签到 |
+| `-a` / `--auto` | 持续扫描课堂并签到，直到成功 |
 | `-k` / `--keepalive` | 仅执行会话保活 |
 | `--qr` | 强制重新显示桌面端登录二维码 |
 | `--cooldown N` | 签到去重冷却时间（分钟，默认 15） |
-| `-s N` / `--schedule N` | 延迟 N 分钟后开始，每分钟检测一次课堂并签到 |
+| `-s N` / `--schedule N` | 延迟 N 分钟后开始，持续签到直到成功 |
 
-### Cron 定时任务示例
+### 长驻运行建议
 
 ```bash
 # 每4小时保活一次
 0 */4 * * * cd /path/to/yuketang && python yuketang_helper.py -k >> cron.log 2>&1
 
-# 工作日上课时段自动签到（仅供参考）
-50 7,13,18 * * 1-5 cd /path/to/yuketang && python yuketang_helper.py -a >> cron.log 2>&1
-0 10,16 * * 1-5 cd /path/to/yuketang && python yuketang_helper.py -a >> cron.log 2>&1
+# 延迟 5 分钟后启动持续签到（会一直运行到签到成功）
+python yuketang_helper.py -s 5
 ```
+
+`-a` / `-s` 是“持续运行直到签到成功”模式，不建议高频由 Cron 重复拉起。
 
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `yuketang_helper.py` | 主程序，负责签到、保活、用户交互 |
-| `auto_login_hack.py` | 自动化登录引擎，通过 Playwright 破解验证码获取 Session |
-| `yuketang_session.json` | 持久化状态文件（Cookie + 签到记录），自动生成 |
+| `yuketang_helper.py` | 桌面端登录版主程序（签到、保活、持续重试、推送） |
+| `yuketang_helper_web.py` | Web 账密登录版主程序（签到、保活、持续重试、推送） |
+| `yuketang_session.json` | 桌面端持久化状态文件（Cookie + 签到记录），自动生成 |
+| `yuketang_session_web.json` | Web 版持久化状态文件（Cookie + 签到记录），自动生成 |
 
 ## 签到去重机制
 

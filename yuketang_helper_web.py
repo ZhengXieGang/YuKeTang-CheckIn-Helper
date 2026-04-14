@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 import qrcode
@@ -33,6 +33,20 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
 AUTO_LOGIN_PHONE = ""
 AUTO_LOGIN_PSWD = ""
 CHECKIN_COOLDOWN_MINUTES = 15
+SCHEDULE_INTERVAL_SECONDS = 60  # 持续检测间隔（秒）
+SCHEDULE_TIMEOUT_MINUTES = 30  # 首轮超时时间（分钟）
+SCHEDULE_EXTENSION_MINUTES = 15  # 每次超时后追加等待时间（分钟）
+
+PUSHPLUS_TOKEN = ""  # 留空则关闭推送
+PUSHPLUS_CHANNEL = "wechat"  # wechat / mail / webhook / cp / sms
+PUSHPLUS_TEMPLATE = "txt"
+PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
+PUSHPLUS_CONTENT_TEMPLATE = (
+    "签到成功\n"
+    "模式：{backend}\n"
+    "课堂：{lesson_id}\n"
+    "时间：{success_time}"
+)
 # ==============================
 
 GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -45,6 +59,11 @@ BROWSER_SYNC_WAIT_SECONDS = 6
 
 def log(msg):
     print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}")
+
+
+class SafeFormatDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
 
 
 def read_json_file(path, default):
@@ -574,6 +593,36 @@ class YuketangHelper:
         }
         self._save_state(state)
 
+    def _pushplus_notify_success(self, lesson_id):
+        token = str(PUSHPLUS_TOKEN).strip()
+        if not token:
+            return
+
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        context = {
+            "backend": "web",
+            "lesson_id": str(lesson_id),
+            "success_time": now_text,
+        }
+        title = PUSHPLUS_TITLE_TEMPLATE.format_map(SafeFormatDict(context))
+        content = PUSHPLUS_CONTENT_TEMPLATE.format_map(SafeFormatDict(context))
+        payload = {
+            "token": token,
+            "title": title,
+            "content": content,
+            "template": PUSHPLUS_TEMPLATE,
+            "channel": PUSHPLUS_CHANNEL,
+        }
+        try:
+            resp = requests.post("https://www.pushplus.plus/send", json=payload, timeout=10)
+            data = resp.json() if "application/json" in resp.headers.get("Content-Type", "") else {}
+            if str(data.get("code")) == "200":
+                log("[+] PushPlus 推送成功")
+            else:
+                log(f"[!] PushPlus 推送失败: {data.get('msg') or resp.text[:120]}")
+        except Exception as e:
+            log(f"[!] PushPlus 推送异常: {e}")
+
     def auto_login(self, phone, password):
         if not HAS_AUTO_LOGIN:
             log("[!] 未安装 ddddocr/playwright，无法使用自动登录")
@@ -678,6 +727,7 @@ class YuketangHelper:
                 log(f"[+] 签到成功 (课堂: {lesson_id})")
                 self._record_checkin(lesson_id)
                 self.save_session()
+                self._pushplus_notify_success(lesson_id)
                 return True
             else:
                 log(f"[-] 签到失败: {res.get('msg')}")
@@ -701,9 +751,43 @@ class YuketangHelper:
             return False
 
 
+def run_until_success(helper, delay_minutes=0, return_to_menu=False):
+    interval_seconds = max(5, int(SCHEDULE_INTERVAL_SECONDS))
+    timeout_minutes = max(1, int(SCHEDULE_TIMEOUT_MINUTES))
+    extension_minutes = max(1, int(SCHEDULE_EXTENSION_MINUTES))
+
+    if delay_minutes > 0:
+        log(f"[*] 将在 {delay_minutes} 分钟后开始持续签到...")
+        time.sleep(delay_minutes * 60)
+
+    deadline = datetime.now() + timedelta(minutes=timeout_minutes)
+    log(
+        f"[*] 已启动持续签到（间隔 {interval_seconds} 秒，"
+        f"首轮超时 {timeout_minutes} 分钟，每次超时追加 {extension_minutes} 分钟）"
+    )
+    try:
+        while True:
+            lesson_id, classroom_id = helper.get_active_lesson_data()
+            if lesson_id:
+                if helper.sign_in(lesson_id, classroom_id=classroom_id):
+                    log("[+] 已签到成功，结束持续签到")
+                    return 0
+                log(f"[-] 课堂 {lesson_id} 本次未签到成功，继续重试...")
+            else:
+                log(f"[-] 当前没有正在进行的课堂，{interval_seconds} 秒后重试...")
+
+            if datetime.now() >= deadline:
+                deadline = datetime.now() + timedelta(minutes=extension_minutes)
+                log(f"[*] 已到超时点，自动追加 {extension_minutes} 分钟继续等待...")
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        log("[*] 已停止持续签到")
+        return 0 if return_to_menu else 130
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）")
-    parser.add_argument("-a", "--auto", action="store_true", help="自动扫描课堂并签到")
+    parser.add_argument("-a", "--auto", action="store_true", help="持续扫描课堂并签到，直到成功")
     parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("--qr", action="store_true", help="强制使用二维码扫码登录")
     parser.add_argument("-p", "--phone", type=str, help="手机号（覆盖脚本内置配置）")
@@ -714,7 +798,7 @@ if __name__ == "__main__":
         default=CHECKIN_COOLDOWN_MINUTES,
         help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）",
     )
-    parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，每分钟自动检测并签到")
+    parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，持续签到直到成功")
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
@@ -746,30 +830,10 @@ if __name__ == "__main__":
         sys.exit(0 if helper.keep_alive() else 1)
 
     if args.auto:
-        lesson_id, classroom_id = helper.get_active_lesson_data()
-        if lesson_id:
-            sys.exit(0 if helper.sign_in(lesson_id, classroom_id=classroom_id) else 1)
-        else:
-            log("[-] 当前没有正在进行的课堂")
-        sys.exit(0)
+        sys.exit(run_until_success(helper, delay_minutes=0))
 
     if args.schedule is not None:
-        delay = args.schedule
-        if delay > 0:
-            log(f"[*] 将在 {delay} 分钟后开始自动签到循环...")
-            time.sleep(delay * 60)
-        log("[*] 开始自动签到循环（每 60 秒检测一次，Ctrl+C 退出）")
-        try:
-            while True:
-                lesson_id, classroom_id = helper.get_active_lesson_data()
-                if lesson_id:
-                    helper.sign_in(lesson_id, classroom_id=classroom_id)
-                else:
-                    log("[-] 当前没有正在进行的课堂，60 秒后重试...")
-                time.sleep(60)
-        except KeyboardInterrupt:
-            log("[*] 已停止定时签到")
-        sys.exit(0)
+        sys.exit(run_until_success(helper, delay_minutes=max(0, int(args.schedule))))
 
     while True:
         print("\n1. 自动扫描签到\n2. 扫码登录\n3. 定时签到\n4. 退出")
@@ -778,11 +842,7 @@ if __name__ == "__main__":
         except (KeyboardInterrupt, EOFError):
             sys.exit(0)
         if choice == "1":
-            lesson_id, classroom_id = helper.get_active_lesson_data()
-            if lesson_id:
-                helper.sign_in(lesson_id, classroom_id=classroom_id)
-            else:
-                log("[-] 当前没有正在进行的课堂")
+            run_until_success(helper, delay_minutes=0, return_to_menu=True)
         elif choice == "2":
             state, uuid = helper.get_login_qrcode()
             if state:
@@ -792,19 +852,6 @@ if __name__ == "__main__":
                 delay = int(input("请输入延迟分钟数 (0 = 立即开始): ").strip())
             except (ValueError, KeyboardInterrupt, EOFError):
                 continue
-            if delay > 0:
-                log(f"[*] 将在 {delay} 分钟后开始自动签到循环...")
-                time.sleep(delay * 60)
-            log("[*] 开始自动签到循环（每 60 秒检测一次，Ctrl+C 返回菜单）")
-            try:
-                while True:
-                    lesson_id, classroom_id = helper.get_active_lesson_data()
-                    if lesson_id:
-                        helper.sign_in(lesson_id, classroom_id=classroom_id)
-                    else:
-                        log("[-] 当前没有正在进行的课堂，60 秒后重试...")
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                log("[*] 已停止定时签到，返回菜单")
+            run_until_success(helper, delay_minutes=max(0, delay), return_to_menu=True)
         elif choice == "4":
             sys.exit(0)
