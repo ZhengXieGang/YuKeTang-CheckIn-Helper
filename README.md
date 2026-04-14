@@ -76,7 +76,7 @@ WEEKLY_TASKS = [
 
 ```python
 ICS_ENABLED = True
-ICS_FILENAME = "校验导出.ics"
+ICS_FILENAME = "xxxx.ics"
 ICS_FILE = Path(__file__).resolve().with_name(ICS_FILENAME)
 ICS_LOOKAHEAD_COUNT = 2
 ICS_WINDOW_MINUTES = 10

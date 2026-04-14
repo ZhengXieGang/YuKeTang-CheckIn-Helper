@@ -29,7 +29,7 @@ WEEKLY_TASKS = [
 ]
 
 ICS_ENABLED = False  # 是否启用 ICS 调度策略
-ICS_FILENAME = "校验导出.ics"  # 只写文件名，脚本会在同目录读取
+ICS_FILENAME = ".ics"  # 只写文件名，脚本会在同目录读取
 ICS_FILE = Path(__file__).resolve().with_name(ICS_FILENAME)
 ICS_LOOKAHEAD_COUNT = 2  # 仅保留未来 N 个 ICS 文件时间点
 ICS_WINDOW_MINUTES = 10  # ICS 每个时间点默认窗口（分钟）
