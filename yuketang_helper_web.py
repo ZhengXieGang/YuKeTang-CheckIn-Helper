@@ -21,6 +21,14 @@ import qrcode
 import requests
 
 try:
+    from apscheduler.schedulers.blocking import BlockingScheduler
+
+    HAS_APSCHEDULER = True
+except ImportError:
+    BlockingScheduler = None
+    HAS_APSCHEDULER = False
+
+try:
     from playwright.async_api import async_playwright
 
     HAS_PLAYWRIGHT = True
@@ -53,7 +61,7 @@ ICS_ENABLED = True  # 是否启用 ICS 调度
 ICS_FILENAME = "校验导出.ics"  # 只写文件名，脚本会自动在当前目录读取
 ICS_FILE = Path(__file__).resolve().with_name(ICS_FILENAME)
 ICS_LOOKAHEAD_COUNT = 2  # 仅保留未来 N 个 ICS 时间点
-ICS_WINDOW_MINUTES = 10  # ICS 每个时间点默认窗口（分钟）
+ICS_WINDOW_MINUTES = 10  # 围绕上课开始时间点的总窗口分钟数（10=前5后5）
 SCHEDULER_EXTENSION_MINUTES = 15  # 统一追加重试时间（分钟）
 
 PUSHPLUS_TOKEN = ""  # PushPlus token（为空=关闭推送）
@@ -83,10 +91,26 @@ DESKTOP_STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
 BROWSER_SYNC_WAIT_SECONDS = 6
 
 
+def resolve_local_timezone():
+    if ZoneInfo:
+        try:
+            return ZoneInfo("Asia/Shanghai")
+        except Exception:
+            pass
+    return timezone(timedelta(hours=8))
+
+
 def log(msg):
     if not ENABLE_RUNTIME_LOG:
         return
     print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}] {msg}")
+
+
+def ensure_apscheduler(feature_name: str) -> bool:
+    if HAS_APSCHEDULER:
+        return True
+    print(f"[!] {feature_name} 需要 apscheduler，请先安装：pip install apscheduler")
+    return False
 
 
 def read_json_file(path, default):
@@ -182,7 +206,10 @@ class CheckinScheduler:
         self.settings = settings
         self.sign_func = sign_func
         self.last_attempts: dict[str, datetime] = {}
-        self.local_tz = ZoneInfo("Asia/Shanghai") if ZoneInfo else timezone(timedelta(hours=8))
+        self.local_tz = resolve_local_timezone()
+        self._daemon_state: dict[str, Any] | None = None
+        self._daemon_last_cleanup_day: date | None = None
+        self._run_next_scheduler = None
         self._ics_cache_signature = None
         self._ics_cache_windows: list[TaskWindow] = []
         self.validate_configuration()
@@ -425,13 +452,21 @@ class CheckinScheduler:
         summary = self.unescape_ics_text(summary_items[0][1])
         course_id = summary or "AUTO"
 
-        start_at = self.parse_ics_datetime(dtstart_items[0][1], dtstart_items[0][0])
+        class_start_at = self.parse_ics_datetime(dtstart_items[0][1], dtstart_items[0][0])
         window_minutes = max(1, int(self.settings.ics_window_minutes))
-        end_at = start_at + timedelta(minutes=window_minutes)
+        before_minutes = window_minutes // 2
+        after_minutes = window_minutes - before_minutes
+        start_at = class_start_at - timedelta(minutes=before_minutes)
+        end_at = class_start_at + timedelta(minutes=after_minutes)
         extension_minutes = max(0, int(self.settings.extension_minutes))
+        around_label = (
+            f"(±{before_minutes}m)"
+            if before_minutes == after_minutes
+            else f"(-{before_minutes}/+{after_minutes}m)"
+        )
         return TaskWindow(
             course_id=course_id,
-            rule_label=f"ICS {summary} {start_at.strftime('%m-%d %H:%M')}(+{window_minutes}m)",
+            rule_label=f"ICS {summary} {class_start_at.strftime('%m-%d %H:%M')}{around_label}",
             target_date=start_at.date(),
             start_at=start_at,
             end_at=end_at,
@@ -613,44 +648,84 @@ class CheckinScheduler:
         self.pushplus_notify(window, success_time)
         return True
 
+    def process_active_windows_once(self) -> int:
+        state = self.ensure_state()
+        now = datetime.now()
+        success_count = 0
+        for window in self.get_active_windows(now, state):
+            if self.process_window(window, state):
+                success_count += 1
+        return success_count
+
+    def _daemon_tick(self) -> None:
+        now = datetime.now()
+        today = now.date()
+        if self._daemon_state is None:
+            self._daemon_state = self.ensure_state()
+            self._daemon_last_cleanup_day = today
+            self.last_attempts.clear()
+        elif self._daemon_last_cleanup_day != today:
+            self._daemon_state = self.cleanup_state(self._daemon_state, today)
+            self.save_state(self._daemon_state)
+            self._daemon_last_cleanup_day = today
+            self.last_attempts.clear()
+
+        for window in self.get_active_windows(now, self._daemon_state):
+            self.process_window(window, self._daemon_state)
+
+    def _run_next_job(self, group: list[TaskWindow], state: dict[str, Any]) -> None:
+        now = datetime.now()
+        active = [window for window in group if window.start_at <= now <= window.extended_end_at]
+        for window in active:
+            self.process_window(window, state)
+        if self._run_next_scheduler is not None:
+            self._run_next_scheduler.shutdown(wait=False)
+
     def run_next(self) -> int:
+        if not ensure_apscheduler("调度模式 -run-next"):
+            return 1
+
         state = self.ensure_state()
         next_time, group = self.get_next_candidate_group(datetime.now(), state)
         if not next_time or not group:
             return 0
 
-        sleep_seconds = (next_time - datetime.now()).total_seconds()
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
+        if next_time <= datetime.now():
+            self._run_next_job(group, state)
+            return 0
 
-        while True:
-            now = datetime.now()
-            active = [window for window in group if window.start_at <= now <= window.extended_end_at]
-            if not active:
-                return 0
-            for window in active:
-                self.process_window(window, state)
-            if all(self.has_success_today(state, window.success_key, window.target_date) for window in group):
-                return 0
-            time.sleep(self.settings.loop_interval_seconds)
+        scheduler = BlockingScheduler(timezone=self.local_tz)
+        self._run_next_scheduler = scheduler
+        run_at = next_time.replace(tzinfo=self.local_tz)
+        scheduler.add_job(self._run_next_job, "date", run_date=run_at, args=[group, state], id="run-next-once")
+        try:
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            return 0
+        finally:
+            self._run_next_scheduler = None
+        return 0
 
     def run_daemon(self) -> int:
-        state = self.ensure_state()
-        last_cleanup_day = datetime.now().date()
-        self.last_attempts.clear()
+        if not ensure_apscheduler("调度模式 -daemon"):
+            return 1
 
-        while True:
-            now = datetime.now()
-            if now.date() != last_cleanup_day:
-                state = self.cleanup_state(state, now.date())
-                self.save_state(state)
-                self.last_attempts.clear()
-                last_cleanup_day = now.date()
-
-            for window in self.get_active_windows(now, state):
-                self.process_window(window, state)
-
-            time.sleep(self.settings.loop_interval_seconds)
+        self._daemon_state = None
+        self._daemon_last_cleanup_day = None
+        scheduler = BlockingScheduler(timezone=self.local_tz)
+        scheduler.add_job(
+            self._daemon_tick,
+            "interval",
+            seconds=max(1, int(self.settings.loop_interval_seconds)),
+            next_run_time=datetime.now(self.local_tz),
+            id="daemon-loop",
+            replace_existing=True,
+        )
+        try:
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            return 0
+        return 0
 
 def persist_cookie_records(cookies):
     state = load_state_dict()
@@ -1301,28 +1376,122 @@ def build_scheduler(helper):
     )
 
 
+def run_auto_sign_loop_with_aps(helper, delay_minutes: int, interval_seconds: int, return_to_menu: bool = False) -> int:
+    if not ensure_apscheduler("定时签到（-s / 菜单定时）"):
+        return 1
+
+    scheduler = BlockingScheduler(timezone=resolve_local_timezone())
+    start_time = datetime.now(resolve_local_timezone()) + timedelta(minutes=max(0, delay_minutes))
+
+    def job():
+        lesson_id, classroom_id = helper.get_active_lesson_data()
+        if lesson_id:
+            helper.sign_in(lesson_id, classroom_id=classroom_id)
+        else:
+            log(f"[-] 当前没有正在进行的课堂，{interval_seconds} 秒后重试...")
+
+    scheduler.add_job(
+        job,
+        "interval",
+        seconds=interval_seconds,
+        next_run_time=start_time,
+        id="auto-sign-loop",
+        replace_existing=True,
+    )
+    log(f"[*] 开始自动签到循环（每 {interval_seconds} 秒检测一次，Ctrl+C {'返回菜单' if return_to_menu else '退出'}）")
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        log("[*] 已停止定时签到")
+        return 0
+    return 0
+
+
+def test_ics_reading(ics_path: Path) -> int:
+    if not ics_path.exists():
+        print(f"[!] ICS 文件不存在: {ics_path}")
+        return 1
+
+    scheduler = CheckinScheduler(
+        SchedulerSettings(
+            weekly_tasks=[],
+            ics_enabled=True,
+            ics_file=ics_path,
+            ics_lookahead_count=max(1, ICS_LOOKAHEAD_COUNT),
+            ics_window_minutes=ICS_WINDOW_MINUTES,
+            extension_minutes=SCHEDULER_EXTENSION_MINUTES,
+            state_file=SCHEDULER_STATE_FILE,
+            state_retention_days=SCHEDULER_STATE_RETENTION_DAYS,
+            retry_interval_seconds=SCHEDULER_RETRY_INTERVAL_SECONDS,
+            loop_interval_seconds=SCHEDULER_LOOP_INTERVAL_SECONDS,
+            pushplus_token="",
+            pushplus_channel=PUSHPLUS_CHANNEL,
+            pushplus_template=PUSHPLUS_TEMPLATE,
+            pushplus_title_template=PUSHPLUS_TITLE_TEMPLATE,
+            pushplus_content_template=PUSHPLUS_CONTENT_TEMPLATE,
+            backend_name="web",
+        ),
+        sign_func=lambda window: False,
+    )
+
+    all_windows = scheduler.load_ics_windows()
+    now = datetime.now()
+    future_windows = [window for window in all_windows if window.extended_end_at >= now]
+    future_windows.sort(key=lambda item: (item.start_at, item.course_id, item.summary))
+    next_windows = scheduler.limit_to_next_times(
+        future_windows,
+        now,
+        count=max(1, ICS_LOOKAHEAD_COUNT),
+    )
+
+    print(f"[*] ICS 文件: {ics_path}")
+    print(f"[*] 解析到事件数: {len(all_windows)}")
+    if not next_windows:
+        print("[*] 没有未来可执行时间点")
+        return 0
+
+    print("[*] 未来时间点预览:")
+    for idx, window in enumerate(next_windows, start=1):
+        print(
+            f"  {idx}. {window.summary or window.course_id} | "
+            f"{window.start_at.strftime('%Y-%m-%d %H:%M')} ~ {window.end_at.strftime('%H:%M')} "
+            f"(扩展至 {window.extended_end_at.strftime('%H:%M')})"
+        )
+    return 0
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）")
-    parser.add_argument("-a", "--auto", action="store_true", help="自动扫描课堂并签到")
-    parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
-    parser.add_argument("-p", "--phone", type=str, help="手机号（覆盖脚本内置配置）")
-    parser.add_argument("-pw", "--password", type=str, help="密码（覆盖脚本内置配置）")
+    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）", add_help=False)
+    parser.add_argument("-h", action="help", help="show this help message and exit")
+    parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="自动扫描课堂并签到")
+    parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
+    parser.add_argument("-p", "-phone", dest="phone", type=str, help="手机号（覆盖脚本内置配置）")
+    parser.add_argument("-pw", "-password", dest="password", type=str, help="密码（覆盖脚本内置配置）")
     parser.add_argument(
-        "--cooldown",
+        "-cooldown",
+        dest="cooldown",
         type=int,
         default=CHECKIN_COOLDOWN_MINUTES,
         help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）",
     )
     parser.add_argument(
         "-s",
-        "--schedule",
+        "-schedule",
+        dest="schedule",
         type=int,
         nargs="+",
         metavar="N",
         help="延迟 N 分钟后开始；可选再给一个数字作为检测间隔秒数（默认 60）",
     )
-    parser.add_argument("--run-next", action="store_true", help="调度模式：只等最近一次任务窗口，执行后退出")
-    parser.add_argument("--daemon", action="store_true", help="调度模式：持续检查周计划/ICS，命中窗口即自动签到，直到手动停止")
+    parser.add_argument("-run-next", dest="run_next", action="store_true", help="调度模式：只等最近一次任务窗口，执行后退出")
+    parser.add_argument("-daemon", dest="daemon", action="store_true", help="调度模式：持续检查周计划/ICS，命中窗口即自动签到，直到手动停止")
+    parser.add_argument(
+        "-test-ics",
+        nargs="?",
+        const="",
+        metavar="FILE",
+        help="测试读取 ICS 文件（可选：传入文件名覆盖 ICS_FILENAME）",
+    )
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
@@ -1330,6 +1499,15 @@ if __name__ == "__main__":
     password = args.password or AUTO_LOGIN_PSWD
 
     helper = YuketangHelper()
+
+    if args.test_ics is not None:
+        if str(args.test_ics).strip():
+            candidate = Path(str(args.test_ics).strip())
+            ics_path = candidate if candidate.is_absolute() else Path(__file__).resolve().with_name(str(args.test_ics).strip())
+        else:
+            ics_path = ICS_FILE
+        sys.exit(test_ics_reading(ics_path))
+
     auth = helper.load_session()
 
     if not auth:
@@ -1341,7 +1519,7 @@ if __name__ == "__main__":
             log("[*] 未检测到自动登录依赖 (ddddocr/playwright)，跳过自动登录")
 
     if not auth:
-        log("[!] 登录失败，请检查账号、依赖和网络配置")
+        print("[!] 登录失败，请检查账号、依赖和网络配置")
         sys.exit(1)
 
     if args.keepalive:
@@ -1351,7 +1529,7 @@ if __name__ == "__main__":
         try:
             scheduler = build_scheduler(helper)
         except ValueError as e:
-            log(f"[!] 调度配置错误: {e}")
+            print(f"[!] 调度配置错误: {e}")
             sys.exit(1)
         try:
             sys.exit(scheduler.run_next() if args.run_next else scheduler.run_daemon())
@@ -1363,33 +1541,21 @@ if __name__ == "__main__":
         if lesson_id:
             sys.exit(0 if helper.sign_in(lesson_id, classroom_id=classroom_id) else 1)
         else:
-            log("[-] 当前没有正在进行的课堂")
+            print("[-] 当前没有正在进行的课堂")
         sys.exit(0)
 
     if args.schedule is not None:
         if not (1 <= len(args.schedule) <= 2):
-            log("[!] -s/--schedule 参数格式错误，应为: -s 延迟分钟 [检测秒数]")
+            print("[!] -s/-schedule 参数格式错误，应为: -s 延迟分钟 [检测秒数]")
             sys.exit(1)
         delay = args.schedule[0]
         interval_seconds = args.schedule[1] if len(args.schedule) == 2 else 60
         if interval_seconds <= 0:
-            log("[!] 检测间隔必须大于 0 秒")
+            print("[!] 检测间隔必须大于 0 秒")
             sys.exit(1)
         if delay > 0:
             log(f"[*] 将在 {delay} 分钟后开始自动签到循环...")
-            time.sleep(delay * 60)
-        log(f"[*] 开始自动签到循环（每 {interval_seconds} 秒检测一次，Ctrl+C 退出）")
-        try:
-            while True:
-                lesson_id, classroom_id = helper.get_active_lesson_data()
-                if lesson_id:
-                    helper.sign_in(lesson_id, classroom_id=classroom_id)
-                else:
-                    log(f"[-] 当前没有正在进行的课堂，{interval_seconds} 秒后重试...")
-                time.sleep(interval_seconds)
-        except KeyboardInterrupt:
-            log("[*] 已停止定时签到")
-        sys.exit(0)
+        sys.exit(run_auto_sign_loop_with_aps(helper, delay, interval_seconds))
 
     while True:
         print("\n1. 自动扫描签到\n2. 定时签到\n3. 退出")
@@ -1402,7 +1568,7 @@ if __name__ == "__main__":
             if lesson_id:
                 helper.sign_in(lesson_id, classroom_id=classroom_id)
             else:
-                log("[-] 当前没有正在进行的课堂")
+                print("[-] 当前没有正在进行的课堂")
         elif choice == "2":
             try:
                 delay = int(input("请输入延迟分钟数 (0 = 立即开始): ").strip())
@@ -1410,17 +1576,6 @@ if __name__ == "__main__":
                 continue
             if delay > 0:
                 log(f"[*] 将在 {delay} 分钟后开始自动签到循环...")
-                time.sleep(delay * 60)
-            log("[*] 开始自动签到循环（每 60 秒检测一次，Ctrl+C 返回菜单）")
-            try:
-                while True:
-                    lesson_id, classroom_id = helper.get_active_lesson_data()
-                    if lesson_id:
-                        helper.sign_in(lesson_id, classroom_id=classroom_id)
-                    else:
-                        log("[-] 当前没有正在进行的课堂，60 秒后重试...")
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                log("[*] 已停止定时签到，返回菜单")
+            run_auto_sign_loop_with_aps(helper, delay, 60, return_to_menu=True)
         elif choice == "3":
             sys.exit(0)

@@ -14,6 +14,12 @@
 pip install requests qrcode
 ```
 
+如需启用调度（`-run-next` / `-daemon` / `-s`）：
+
+```bash
+pip install apscheduler
+```
+
 Web 版脚本：
 
 ```bash
@@ -28,7 +34,7 @@ playwright install chromium
 桌面版：
 
 ```bash
-python yuketang_helper.py --qr              # 首次扫码登录（或者直接运行一次）
+python yuketang_helper.py -qr               # 首次扫码登录（或者直接运行一次）
 python yuketang_helper.py -a                # 自动扫描当前课堂并签到
 python yuketang_helper.py -k                # 会话保活
 ```
@@ -44,8 +50,15 @@ python yuketang_helper_web.py -k
 
 
 ```bash
-python yuketang_helper.py --run-next   #计算最近一轮调度任务，等待并执行后退出（适合配合 cron）
-python yuketang_helper.py --daemon     #持续检查周计划/ICS，命中窗口就自动签到，直到 Ctrl+C
+python yuketang_helper.py -run-next    #计算最近一轮调度任务，等待并执行后退出（适合配合 cron）
+python yuketang_helper.py -daemon      #常驻调度：持续检查周计划/ICS，命中窗口就自动签到，直到 Ctrl+C
+```
+
+测试读取 ICS：
+
+```bash
+python yuketang_helper.py -test-ics            # 按配置里的 ICS_FILENAME 测试解析
+python yuketang_helper.py -test-ics 课表.ics   # 指定同目录文件名测试解析
 ```
 
 ## 用户配置
@@ -88,7 +101,7 @@ SCHEDULER_EXTENSION_MINUTES = 15
 - 脚本只读取 ICS 里的上课开始时间（`DTSTART`）和课程名（`SUMMARY`）
 - 命中 ICS 时间窗口后会自动扫描“当前正在进行的课堂”并签到
 - `ICS_LOOKAHEAD_COUNT`：保留多少个未来时间点
-- `ICS_WINDOW_MINUTES`：每个 ICS 时间点的默认签到窗口长度
+- `ICS_WINDOW_MINUTES`：围绕上课开始时间点的总窗口分钟数（例如 10 = 提前 5 分钟到开始后 5 分钟）
 - `SCHEDULER_EXTENSION_MINUTES`：统一追加重试分钟数（每周调度与 ICS 调度共用，默认 15）
 
 ### 3) PushPlus 推送
@@ -130,23 +143,28 @@ PUSHPLUS_CONTENT_TEMPLATE = (
 
 - 必改：`WEEKLY_TASKS` 或 `ICS_FILENAME`（至少配一个调度来源）。
 - 常改：`BASE_DOMAIN`、`PUSHPLUS_TOKEN`、`PUSHPLUS_CHANNEL`。
-- 调度配置不完整只会影响 `--run-next/--daemon`；`-a`、`-k` 和直接运行菜单模式不依赖调度配置。
+- 调度配置不完整只会影响 `-run-next/-daemon`；`-a`、`-k` 和直接运行菜单模式不依赖调度配置。
 
 ## 命令行参数
 
 两个主脚本通用参数：
 
-- `-a, --auto` 自动扫描当前课堂并签到
-- `-k, --keepalive` 仅保活
-- `--run-next` 只处理最近一次调度窗口，然后退出
-- `--daemon` 持续检查周计划/ICS，命中窗口就自动签到，直到手动停止
-- `--cooldown N` 重复签到冷却分钟数
-- `-s N [S], --schedule N [S]` 延迟 N 分钟后开始，检测间隔可选 S 秒（默认 60）
+- `-a` / `-auto` 自动扫描当前课堂并签到
+- `-k` / `-keepalive` 仅保活
+- `-run-next` 只处理最近一次调度窗口，然后退出
+- `-daemon` 持续检查周计划/ICS，命中窗口就自动签到，直到手动停止
+- `-cooldown N` 重复签到冷却分钟数
+- `-s N [S]` / `-schedule N [S]` 延迟 N 分钟后开始，检测间隔可选 S 秒（默认 60）
+- `-test-ics [FILE]` 测试读取 ICS 文件并打印未来时间点预览
 
 Web 版附加参数：
 
-- `-p, --phone`
-- `-pw, --password`
+- `-p` / `-phone`
+- `-pw` / `-password`
+
+说明：
+
+- 未安装 `apscheduler` 时，`-run-next` / `-daemon` / `-s` 不可用；`-a`、`-k`、扫码登录、菜单基础功能仍可正常使用。
 
 ## 文件说明
 
