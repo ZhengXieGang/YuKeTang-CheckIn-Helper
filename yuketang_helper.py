@@ -11,13 +11,13 @@ import requests
 
 # ========== 用户配置 ==========
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
-CHECKIN_COOLDOWN_MINUTES = 15
-SCHEDULE_INTERVAL_SECONDS = 60  # 持续检测间隔（秒）
-SCHEDULE_TIMEOUT_MINUTES = 30  # 首轮超时时间（分钟）
-SCHEDULE_EXTENSION_MINUTES = 15  # 每次超时后追加等待时间（分钟）
+CHECKIN_COOLDOWN_MINUTES = 15           # 签到冷却时长
+SCHEDULE_INTERVAL_SECONDS = 20          # 持续检测间隔（秒）
+SCHEDULE_TIMEOUT_MINUTES = 30           # 首轮超时时间（分钟）
+SCHEDULE_EXTENSION_MINUTES = 15         # 每次超时后追加等待时间（分钟）
 
-PUSHPLUS_TOKEN = ""  # 留空则关闭推送
-PUSHPLUS_CHANNEL = "wechat"  # wechat / mail / webhook / cp / sms
+PUSHPLUS_TOKEN = ""                     # 留空则关闭推送
+PUSHPLUS_CHANNEL = "wechat"             # wechat / mail / webhook / cp / sms
 PUSHPLUS_TEMPLATE = "txt"
 PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
 PUSHPLUS_CONTENT_TEMPLATE = (
@@ -553,17 +553,19 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（桌面端登录版）")
-    parser.add_argument("-a", "--auto", action="store_true", help="持续扫描课堂并签到，直到成功")
-    parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
-    parser.add_argument("--qr", action="store_true", help="显示桌面端登录二维码")
+    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（桌面端登录版）", add_help=False)
+    parser.add_argument("-h", action="help", help="show this help message and exit")
+    parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
+    parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
+    parser.add_argument("-qr", dest="qr", action="store_true", help="显示桌面端登录二维码")
     parser.add_argument(
-        "--cooldown",
+        "-cooldown",
+        dest="cooldown",
         type=int,
         default=CHECKIN_COOLDOWN_MINUTES,
         help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）",
     )
-    parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，持续签到直到成功")
+    parser.add_argument("-s", "-schedule", dest="schedule", type=int, metavar="N", help="延迟 N 分钟后开始，持续签到直到成功")
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown

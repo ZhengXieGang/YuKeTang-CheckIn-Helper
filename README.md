@@ -1,11 +1,11 @@
 # 雨课堂自动签到助手
 
-长江雨课堂全自动签到工具，支持账号密码自动登录（含验证码破解）和微信扫码登录，适配 Cron 定时任务实现 24/7 无人值守。
+长江雨课堂全自动签到工具，支持微信扫码登录和账号密码自动登录，适配 Cron 定时任务，PushPlus消息推送，实现 24/7 无人值守。
 
 ## 功能和特性
 
-- **全自动账密登录**：基于 Playwright + ddddocr 实现无头浏览器自动登录，自动识别并通过腾讯天御人机验证（汉字点选 / 滑块拼图）
 - **微信扫码登录**：终端内显示二维码，手机扫码即可完成认证
+- **账密登录**（不推荐）：基于 Playwright + ddddocr 实现无头浏览器自动登录，自动识别并通过验证码
 - **自动签到**：自动扫描当前正在进行的课堂并完成签到
 - **签到去重**：同一课堂在冷却期内（默认 15 分钟）不会重复签到
 - **会话保活**：定期刷新 Session，防止过期掉线
@@ -26,14 +26,14 @@ playwright install chromium
 
 ## 使用方法
 
-### 基础用法（建议使用支持 UTF-8 的终端）
+### 基础用法（请使用支持 UTF-8 的终端）
 
 ```bash
 # 首次使用（自动登录 + 签到）
 python yuketang_helper.py -a
 
 # 强制扫码登录
-python yuketang_helper.py --qr
+python yuketang_helper.py -qr
 
 # 交互模式
 python yuketang_helper.py
@@ -68,32 +68,16 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 
 在 `yuketang_helper.py` / `yuketang_helper_web.py` 顶部可直接修改：
 
-```python
-SCHEDULE_INTERVAL_SECONDS = 60
-SCHEDULE_TIMEOUT_MINUTES = 30
-SCHEDULE_EXTENSION_MINUTES = 15
-
-PUSHPLUS_TOKEN = ""
-PUSHPLUS_CHANNEL = "wechat"
-PUSHPLUS_TEMPLATE = "txt"
-PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
-PUSHPLUS_CONTENT_TEMPLATE = (
-    "签到成功\n"
-    "模式：{backend}\n"
-    "课堂：{lesson_id}\n"
-    "时间：{success_time}"
-)
-```
 
 ### 命令行参数
 
 | 参数 | 说明 |
 |------|------|
-| `-a` / `--auto` | 持续扫描课堂并签到，直到成功 |
-| `-k` / `--keepalive` | 仅执行会话保活 |
-| `--qr` | 强制重新显示桌面端登录二维码 |
-| `--cooldown N` | 签到去重冷却时间（分钟，默认 15） |
-| `-s N` / `--schedule N` | 延迟 N 分钟后开始，持续签到直到成功 |
+| `-a` / `-auto` | 持续扫描课堂并签到，直到成功 |
+| `-k` / `-keepalive` | 仅执行会话保活 |
+| `-qr` | 强制重新显示桌面端登录二维码 |
+| `-cooldown N` | 签到去重冷却时间（分钟，默认 15） |
+| `-s N` / `-schedule N` | 延迟 N 分钟后开始，持续签到直到成功 |
 
 ### 长驻运行建议
 
@@ -120,9 +104,9 @@ python yuketang_helper.py -s 5
 
 每次成功签到后会在 `yuketang_session.json` 中记录课堂号和时间。再次对同一课堂签到时，如果距上次不超过冷却时间（默认 15 分钟），则自动跳过。
 
-可通过 `--cooldown` 参数自定义冷却时间：
+可通过 `-cooldown` 参数自定义冷却时间：
 ```bash
-python yuketang_helper.py -a --cooldown 60  # 60 分钟内不重复签到
+python yuketang_helper.py -a -cooldown 60  # 60 分钟内不重复签到
 ```
 
 ---

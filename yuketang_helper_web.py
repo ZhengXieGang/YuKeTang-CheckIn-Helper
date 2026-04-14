@@ -786,19 +786,21 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）")
-    parser.add_argument("-a", "--auto", action="store_true", help="持续扫描课堂并签到，直到成功")
-    parser.add_argument("-k", "--keepalive", action="store_true", help="仅执行会话保活")
-    parser.add_argument("--qr", action="store_true", help="强制使用二维码扫码登录")
-    parser.add_argument("-p", "--phone", type=str, help="手机号（覆盖脚本内置配置）")
-    parser.add_argument("-pw", "--password", type=str, help="密码（覆盖脚本内置配置）")
+    parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）", add_help=False)
+    parser.add_argument("-h", action="help", help="show this help message and exit")
+    parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
+    parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
+    parser.add_argument("-qr", dest="qr", action="store_true", help="强制使用二维码扫码登录")
+    parser.add_argument("-p", "-phone", dest="phone", type=str, help="手机号（覆盖脚本内置配置）")
+    parser.add_argument("-pw", "-password", dest="password", type=str, help="密码（覆盖脚本内置配置）")
     parser.add_argument(
-        "--cooldown",
+        "-cooldown",
+        dest="cooldown",
         type=int,
         default=CHECKIN_COOLDOWN_MINUTES,
         help=f"签到去重冷却时间，分钟（默认 {CHECKIN_COOLDOWN_MINUTES}）",
     )
-    parser.add_argument("-s", "--schedule", type=int, metavar="N", help="延迟 N 分钟后开始，持续签到直到成功")
+    parser.add_argument("-s", "-schedule", dest="schedule", type=int, metavar="N", help="延迟 N 分钟后开始，持续签到直到成功")
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
