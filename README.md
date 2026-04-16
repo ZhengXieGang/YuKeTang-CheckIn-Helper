@@ -45,14 +45,20 @@ python yuketang_helper.py -s 5
 python yuketang_helper.py -k
 ```
 
-### 签到突破测试
+### 动态码签到测试
 
 ```bash
 # 自动测试所有签到路径，输出报告
 python test_checkin_bypass.py
 ```
 
-测试脚本会自动从 `yuketang_session.json` 读取 Cookie，**不会修改 session 文件**，测试完成后输出结构化报告标明每种方法的可用性。
+测试脚本会自动从 `yuketang_session.json` 读取 Cookie，测试完成后输出报告。
+# 方式1: 提供二维码的照片
+python3 test_checkin_bypass.py qr_photo.jpg
+# 方式2: 使用二维码里的 URL
+python3 test_checkin_bypass.py --url "https://changjiang.yuketang.cn/api/v3/..."
+# 方式3: 持续拍摄丢进文件夹（自动识别新图片）
+python3 test_checkin_bypass.py --watch ~/Screenshots/
 
 ### 域名配置
 

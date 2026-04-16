@@ -1,340 +1,458 @@
 #!/usr/bin/env python3
 """
-雨课堂签到协议深度诊断工具 V5
-[极致详情版 + JWT保活机制]
+雨课堂动态二维码签到深度分析工具
 
-核心特性：
-  1. 借鉴积极探测逻辑，全局拦截并刷新 `set-auth`，实现 JWT 永不过期。
-  2. 极致详细的日志输出（展开关键 JSON，记录完整错误码，杜绝信息被截断）。
-  3. 按照真实源码修正了 WS 握手过程 (`detectlesson` -> `hello`)。
+用途：解析动态二维码 → 执行签到 → 抓取所有 HTTP 细节 → 生成详细报告
+用法：
+  python3 test_checkin_bypass.py <二维码图片>
+  python3 test_checkin_bypass.py --url "https://changjiang.yuketang.cn/api/v3/..."
+  python3 test_checkin_bypass.py --watch ~/Screenshots/
 """
 
 import json
 import time
 import os
 import sys
+import argparse
+import glob
 import hashlib
-import threading
+import base64
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlencode
+
 import requests
 
 try:
-    import websocket
+    import cv2
+    HAS_CV2 = True
 except ImportError:
-    print("请安装依赖: pip install websocket-client")
-    sys.exit(1)
-
-from datetime import datetime
+    HAS_CV2 = False
 
 SESSION_FILE = "yuketang_session.json"
 BASE = "https://changjiang.yuketang.cn"
-LOG_FILE = f"ykt_diag_{datetime.now().strftime('%H%M%S')}.log"
+ts = datetime.now().strftime('%H%M%S')
+REPORT_FILE = f"qr_report_{ts}.log"
 
+# ==================== 日志 ====================
 
-def logger(msg, tag="INFO"):
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] [{tag}] {msg}"
+def log(msg, tag="INFO"):
+    line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:12]}] [{tag}] {msg}"
     print(line, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
+    with open(REPORT_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+def log_separator(title=""):
+    log("=" * 60)
+    if title:
+        log(f" {title}")
+        log("=" * 60)
 
-class YKT_Debugger:
-    def __init__(self):
-        self.session = requests.Session()
-        self.lesson_id = None
-        self.classroom_id = None
-        self.ws = None
-        self.uid = 0
-        self.lesson_token = ""
-        self.ws_connected = False
-        self.ws_hello_ok = False
-        self.current_jwt = ""
-        self.session_data = {}
+def dump_dict(d, indent=2):
+    """漂亮打印字典到日志"""
+    for line in json.dumps(d, ensure_ascii=False, indent=indent).split("\n"):
+        log(f"  {line}", "DATA")
 
-        self.load_session()
-        self.fetch_basic_info()
+# ==================== Session 加载 ====================
 
-    def load_session(self):
-        if not os.path.exists(SESSION_FILE):
-            logger(f"未找到 {SESSION_FILE}", "ERROR")
-            return
-        
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            self.session_data = json.load(f)
+def load_session():
+    with open(SESSION_FILE, "r", encoding="utf-8") as f:
+        state = json.load(f)
 
-        self.current_jwt = self.session_data.get("desktop_auth", "")
-        self.uid = self.session_data.get("uid", 0)
+    s = requests.Session()
+    jwt = state.get("desktop_auth", "")
 
-        # 注入 Cookie
-        for c in self.session_data.get("desktop_cookies", []):
-            self.session.cookies.set(
-                c["name"], c["value"],
-                domain=c.get("domain", "changjiang.yuketang.cn"),
-                path=c.get("path", "/")
-            )
-        
-        # 初始化基础 Header
-        self._update_session_headers()
+    for c in state.get("desktop_cookies", []):
+        s.cookies.set(c["name"], c["value"],
+                      domain=c.get("domain", "changjiang.yuketang.cn"),
+                      path=c.get("path", "/"))
 
-    def _update_session_headers(self):
-        headers = {
-            "X-Client": "desktop",
-            "desktop-v": "v2",
-            "xtbz": "ykt",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-        }
-        if self.current_jwt:
-            headers["Authorization"] = f"Bearer {self.current_jwt}"
-        self.session.headers.update(headers)
+    s.headers.update({
+        "xtbz": "ykt",
+        "X-Client": "desktop",
+        "desktop-v": "v2",
+    })
+    if jwt:
+        s.headers["Authorization"] = f"Bearer {jwt}"
 
-    def save_session(self):
-        """将最新的 JWT 保存回文件，实现保活"""
-        self.session_data["desktop_auth"] = self.current_jwt
-        self.session_data["desktop_auth_updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(SESSION_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.session_data, f, ensure_ascii=False, indent=2)
-        logger("JWT 已更新并保存到会话文件", "AUTH")
+    return s, state
 
-    # ==================== 核心 HTTP 请求封装 ====================
+# ==================== 二维码解码 ====================
 
-    def _api(self, method, path, label, **kwargs):
-        """统一拦截响应，提取 set-auth 刷新 JWT，并输出极尽详细的日志"""
-        try:
-            r = self.session.request(method, f"{BASE}{path}", timeout=10, **kwargs)
-            
-            # 【借鉴点1】 JWT 动态续期
-            new_auth = r.headers.get("set-auth") or r.headers.get("Set-Auth")
-            if new_auth and new_auth != self.current_jwt:
-                self.current_jwt = new_auth
-                self._update_session_headers()
-                self.save_session()
-                logger(f"[{label}] 成功捕获并刷新 JWT!", "TOKEN")
-
-            if "json" in r.headers.get("Content-Type", ""):
-                d = r.json()
-                code = d.get("code", "?")
-                msg = d.get("msg", d.get("message", ""))
-                
-                # 记录核心日志，若 code!=0 且有特定数据，则展开打印
-                success = (code == 0 or code == 200)
-                tag = "API_OK" if success else "API_ERR"
-                
-                logger(f"[{label}] -> code={code} | msg={msg}", tag)
-                
-                # 【借鉴点2】 详细日志：如果存在实际有用的数据载荷，完整漂亮地打印它
-                data_obj = d.get("data") or d.get("Data")
-                if data_obj and (success or code not in [50004, 50000]):
-                    dumped = json.dumps(data_obj, ensure_ascii=False, indent=2)
-                    # 每行加缩进记录
-                    for line in dumped.split("\n"):
-                        logger(f"    {line}", tag)
-                return d
-            else:
-                logger(f"[{label}] HTTP {r.status_code} (非 JSON 响应)", "API_RAW")
-                return None
-        except Exception as e:
-            logger(f"[{label}] 异常抛出: {e}", "API_EXC")
+def decode_qr(image_path):
+    if not HAS_CV2:
+        log("需要 opencv-python: pip install opencv-python", "ERROR")
+        return None
+    if not os.path.exists(image_path):
+        log(f"文件不存在: {image_path}", "ERROR")
         return None
 
-    # ==================== 初始化与前置请求 ====================
+    img = cv2.imread(image_path)
+    if img is None:
+        log(f"无法读取图片: {image_path}", "ERROR")
+        return None
 
-    def fetch_basic_info(self):
-        r = self._api("GET", "/api/v3/user/basic-info", "账号信息验证")
-        if r and r.get("code") == 0:
-            self.uid = r["data"]["id"]
-            logger(f"登录上下文有效。UID: {self.uid} (角色: {r['data'].get('role')})", "AUTH")
-        else:
-            logger(f"登录可能过期！请检查 yuketang_session.json", "AUTH")
+    detector = cv2.QRCodeDetector()
+    urls = []
 
-    def get_active_lesson(self):
-        r = self._api("GET", "/api/v3/classroom/on-lesson-upcoming-exam", "活跃课堂探测")
-        if r and r.get("code") == 0 and r["data"].get("onLessonClassrooms"):
-            lesson = r["data"]["onLessonClassrooms"][0]
-            self.lesson_id = str(lesson["lessonId"])
-            self.classroom_id = str(lesson.get("classroomId", ""))
-            course = lesson.get("courseName", "")
-            logger(f"发现活跃课堂: '{course}' (LessonID={self.lesson_id})", "FACT")
-            return True
-        logger("当前未找到正在进行中的课堂。", "INFO")
-        return False
+    # 原图尝试
+    data, _, _ = detector.detectAndDecode(img)
+    if data:
+        urls.append(data)
 
-    def obtain_lesson_token(self):
-        """通过教师端协议(source=10)尝试提取 lessonToken，供 WS 使用"""
-        logger("正在尝试提取 lessonToken...", "TOKEN")
-        r = self._api("POST", "/api/v3/lesson/checkin", "获取WS票据", json={"lessonId": self.lesson_id, "source": 10})
-        if r and r.get("code") == 0:
-            data = r.get("data", {})
-            self.lesson_token = data.get("lessonToken", "")
-            if self.lesson_token:
-                logger(f"成功攫取 lessonToken。长度: {len(self.lesson_token)}", "TOKEN")
-                return True
-        logger("无法攫取 lessonToken，将使用空权限模式建立 WS。", "TOKEN")
-        return False
-
-    # ==================== WebSocket ====================
-
-    def _on_open(self, ws):
-        self.ws_connected = True
-        detect = {"op": "detectlesson", "lessonid": str(self.lesson_id)}
-        logger(f"发送握手阶段 1: {json.dumps(detect)}", "WS_TX")
-        ws.send(json.dumps(detect))
-
-    def _on_message(self, ws, message):
+    # WeChat 检测器
+    if not urls and hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
         try:
-            data = json.loads(message)
-            op = data.get("op", "")
+            wd = cv2.wechat_qrcode_WeChatQRCode()
+            results, _ = wd.detectAndDecode(img)
+            urls.extend([r for r in results if r])
+        except:
+            pass
 
-            # 过滤高频且无价值的心跳
-            if op in ["xintiao"]: return
+    # 多尺度
+    if not urls:
+        for scale in [0.5, 1.5, 2.0]:
+            h, w = img.shape[:2]
+            resized = cv2.resize(img, (int(w * scale), int(h * scale)))
+            data, _, _ = detector.detectAndDecode(resized)
+            if data:
+                urls.append(data)
+                break
 
-            # detectlesson 握手应答
-            if op == "detectlesson":
-                hello = {
-                    "op": "hello",
-                    "userid": int(self.uid),
-                    "role": "student",
-                    "auth": self.lesson_token,
-                    "lessonid": str(self.lesson_id),
-                    "version": 5.5,
-                    "call": -1
-                }
-                logger(f"收到 detect 回复。发送握手阶段 2 (hello): {json.dumps(hello)}", "WS_TX")
-                ws.send(json.dumps(hello))
-                return
+    # 灰度增强
+    if not urls:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        data, _, _ = detector.detectAndDecode(binary)
+        if data:
+            urls.append(data)
 
-            # hello 握手应答
-            if op == "hello":
-                self.ws_hello_ok = True
-                logger(f"✅ WS 身份认证握手成功！详情: {message}", "WS_OK")
-                self._start_heartbeat(ws)
-                return
+    if urls:
+        log(f"解码成功: {urls[0][:100]}...", "QR")
+        return urls[0]
+    log("二维码解码失败", "ERROR")
+    return None
 
-            # 【重要】签到相关的重要协议全量展开
-            if op in ["tryzoomqrcode", "signin", "checkin", "new_check_in", "qrcodezoomed"]:
-                logger(f"🔥🔥🔥 捕获高优指令: {op}", "WS_CRITICAL")
-                dumped = json.dumps(data, ensure_ascii=False, indent=2)
-                for line in dumped.split("\n"):
-                    logger(f"    {line}", "WS_CRITICAL")
-                
-                # 触发猛烈探测
-                threading.Thread(target=self._on_checkin_event, daemon=True).start()
-                return
-            
-            # 其他未知指令，平铺打印
-            logger(f"收到未分类消息: op={op} -> {message}", "WS_RX")
+# ==================== URL 深度解析 ====================
 
-        except Exception as e:
-            logger(f"解析 WS 消息异常: {e} -> {message}", "WS_ERR")
+def deep_analyze_url(url):
+    """深度解析二维码 URL 的每一个参数"""
+    log_separator("URL 深度解析")
 
-    def _on_error(self, ws, error):
-        logger(f"连接抛错: {error}", "WS_ERR")
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
 
-    def _on_close(self, ws, code, msg):
-        self.ws_connected = False
-        logger(f"连接断开: 代码={code} 信息={msg}", "WS_CLOSE")
+    log(f"完整 URL: {url}", "URL")
+    log(f"协议: {parsed.scheme}", "URL")
+    log(f"主机: {parsed.netloc}", "URL")
+    log(f"路径: {parsed.path}", "URL")
+    log(f"参数数量: {len(params)}", "URL")
 
-    def _start_heartbeat(self, ws):
-        # 1. WS 长链接纯二进制心跳（给 Socket 保活用）
-        def _ws_beat():
-            while self.ws_connected:
-                try: ws.send(json.dumps({"op": "xintiao", "lessonid": str(self.lesson_id)}))
-                except: break
-                time.sleep(60)
-                
-        # 2. HTTP 频繁续签心跳（专攻 JWT 30s 死亡硬限）
-        def _http_jwt_beat():
-            while self.ws_connected:
-                time.sleep(15)  # 15s续签，压秒防超时
-                logger("触发后台静默 JWT 续签", "SYS_BEAT")
-                self._api("GET", "/api/v3/user/basic-info", "JWT静默保活")
+    info = {}
+    for key, vals in params.items():
+        val = vals[0]
+        info[key] = val
+        log(f"  {key} = {val}", "PARAM")
 
-        threading.Thread(target=_ws_beat, daemon=True).start()
-        threading.Thread(target=_http_jwt_beat, daemon=True).start()
+        # c 参数分析
+        if key == "c":
+            log(f"    长度: {len(val)}", "PARAM")
+            log(f"    可能为 Base64URL 编码的课堂标识", "PARAM")
+            try:
+                # 尝试 base64 解码
+                padded = val + "=" * (4 - len(val) % 4)
+                decoded = base64.urlsafe_b64decode(padded)
+                log(f"    Base64 解码 ({len(decoded)} bytes): {decoded.hex()}", "PARAM")
+            except:
+                log(f"    Base64 解码失败", "PARAM")
 
-    def start_ws(self):
-        cookie_str = "; ".join([f"{c.name}={c.value}" for c in self.session.cookies])
-        ws_url = "wss://changjiang.yuketang.cn/wsapp/"
-        logger(f"正在建立通信信道: {ws_url}", "WS_INIT")
+        # t 参数分析
+        if key == "t":
+            try:
+                t_ms = int(val)
+                t_sec = t_ms / 1000
+                dt = datetime.fromtimestamp(t_sec)
+                now_ms = int(time.time() * 1000)
+                age_ms = now_ms - t_ms
+                age_sec = age_ms / 1000
+                log(f"    时间戳(ms): {t_ms}", "PARAM")
+                log(f"    对应时间: {dt.strftime('%Y-%m-%d %H:%M:%S.%f')}", "PARAM")
+                log(f"    距今: {age_sec:.1f}s", "PARAM")
+                if age_sec > 10:
+                    log(f"    ⚠️ 已超过 6 秒有效期，签到可能失败", "PARAM")
+                info["_age_sec"] = age_sec
+                info["_t_ms"] = t_ms
+            except:
+                pass
 
-        self.ws = websocket.WebSocketApp(
-            ws_url,
-            header={
-                "Cookie": cookie_str,
-                "User-Agent": self.session.headers.get("User-Agent", ""),
-                "Origin": "https://changjiang.yuketang.cn",
-            },
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        threading.Thread(target=self.ws.run_forever, daemon=True).start()
+        # s 参数分析（签名）
+        if key == "s":
+            log(f"    长度: {len(val)} 字符 = {len(val)*4} bits", "PARAM")
+            try:
+                s_int = int(val, 16)
+                log(f"    十进制: {s_int}", "PARAM")
+                log(f"    这是服务端生成的 HMAC 签名，无法本地伪造", "PARAM")
+            except:
+                log(f"    非十六进制", "PARAM")
 
-        time.sleep(5) # 给定充足的握手窗口
-        if not self.ws_connected: logger("⚠️ WS 底层建立失败，请检查网络阻断情况", "WS_WARN")
-        elif not self.ws_hello_ok: logger("⚠️ WS 底层已建立，但认证无响应", "WS_WARN")
-        else: logger("✅ WS 信令系统一切就绪，等待下发指示...", "WS_OK")
+    return info
 
-    # ==================== 激进式签到突刺 ====================
+# ==================== HTTP 请求深度抓取 ====================
 
-    def _on_checkin_event(self):
-        """当 WS 收到签到指令时，并发式全面发包"""
-        logger(">>> WS 推送接收，立即释放所有表单参数尝试签到 <<<", "BURST")
-        self.run_api_probes()
+def deep_request(session, method, url, label, **kwargs):
+    """发起请求并记录极致详细的 HTTP 交互"""
+    log_separator(f"HTTP 请求: {label}")
 
-    def run_api_probes(self):
-        if not self.lesson_id: return
-        logger("=" * 40, "PROBE")
-        logger("执行启发式表单盲试", "PROBE")
-        lid = self.lesson_id
+    log(f"→ {method} {url}", "REQ")
 
-        # 1. PC 网页常规扫码等途径覆盖
-        self._api("POST", "/api/v3/lesson/checkin", "直接签到s1", json={"lessonId": lid, "source": 1})
-        self._api("POST", "/api/v3/lesson/checkin", "桌面强制加入s43", json={"lessonId": lid, "source": 43, "joinIfNotIn": True})
-        self._api("POST", "/api/v3/lesson/checkin", "暗号容错盲猜s6", json={"lessonId": lid, "source": 6, "inviteCode": "AAAAA"})
+    # 记录请求头
+    log("→ 请求头:", "REQ")
+    merged_headers = dict(session.headers)
+    if "headers" in kwargs:
+        merged_headers.update(kwargs["headers"])
+    for k, v in merged_headers.items():
+        # 截断过长的 header
+        v_str = str(v)
+        if len(v_str) > 200:
+            v_str = v_str[:200] + "..."
+        log(f"    {k}: {v_str}", "REQ")
 
-        # 2. 从源码扒出的各种老版本兼容路由
-        self._api("POST", "/api/lesson/web_check_in", "古早端接口s14", json={"invite_code": "AAAAA", "source": 14})
-        self._api("POST", "/api/v3/lesson/notkn/checkin", "无票据端接口s1", json={"source": 1})
+    # 记录请求 Cookie
+    log("→ Cookie:", "REQ")
+    for c in session.cookies:
+        log(f"    {c.name}={c.value[:30]}... (domain={c.domain} path={c.path})", "REQ")
 
-        # 3. 硬件设施签到突破（极具潜力）
-        dev_id = "PEN_" + hashlib.md5(str(self.uid).encode()).hexdigest()[:12].upper()
-        now_ms = int(time.time() * 1000)
-        for st in [81, 82]:
-            self._api("POST", "/api/v3/vote-machine/lesson-check-in", f"硬件欺骗:st{st}", 
-                      json={"lesson_id": lid, "devices": [{"id": dev_id, "dt": now_ms}], "submit_time": now_ms, "source_type": st})
+    # 记录请求体
+    if "json" in kwargs:
+        log(f"→ Body (JSON):", "REQ")
+        dump_dict(kwargs["json"])
 
-        # 4. 尝试通过伪造越权拉取内容
-        self._api("GET", "/api/v3/lesson/fetch-dynamic-invitation", "动态口令逆拉取", params={"v": 2})
-        logger("=" * 40, "PROBE")
+    try:
+        # 关键：禁止自动重定向，手动跟踪每一步
+        r = session.request(method, url, timeout=15, allow_redirects=False, **kwargs)
+        elapsed = r.elapsed.total_seconds()
+
+        log(f"← HTTP {r.status_code} ({elapsed:.3f}s)", "RESP")
+
+        # 记录所有响应头
+        log("← 响应头:", "RESP")
+        for k, v in r.headers.items():
+            log(f"    {k}: {v[:300]}", "RESP")
+            # 特别关注
+            if k.lower() in ["set-cookie", "set-auth", "location", "x-request-id"]:
+                log(f"    ★ 重要头: {k} = {v}", "KEY")
+
+        # 记录 Set-Cookie
+        if r.cookies:
+            log("← 新 Cookie:", "RESP")
+            for c in r.cookies:
+                log(f"    {c.name}={c.value} (domain={c.domain} path={c.path})", "RESP")
+
+        # 响应体
+        ct = r.headers.get("Content-Type", "")
+        if "json" in ct:
+            try:
+                body = r.json()
+                log("← 响应体 (JSON):", "RESP")
+                dump_dict(body)
+                return r, body
+            except:
+                log(f"← 响应体 (JSON解析失败): {r.text[:500]}", "RESP")
+        elif "html" in ct:
+            log(f"← 响应体 (HTML, {len(r.text)} chars):", "RESP")
+            log(f"    {r.text[:500]}", "RESP")
+        else:
+            log(f"← 响应体 ({ct}, {len(r.content)} bytes):", "RESP")
+            log(f"    {r.text[:500]}", "RESP")
+
+        # 如果是重定向，手动跟踪
+        if r.status_code in [301, 302, 303, 307, 308]:
+            loc = r.headers.get("Location", "")
+            log(f"↳ 重定向到: {loc}", "REDIRECT")
+            if loc:
+                return deep_request(session, "GET", loc, f"{label}→重定向", **{
+                    k: v for k, v in kwargs.items() if k != "json"
+                })
+
+        return r, None
+
+    except Exception as e:
+        log(f"← 异常: {e}", "ERROR")
+        return None, None
+
+# ==================== 签到执行与变体测试 ====================
+
+def run_checkin_analysis(session, url, params):
+    """用各种姿势尝试签到，对比服务器行为"""
+
+    # ====== 测试 1: 原始 GET（标准扫码流程）======
+    # 用手机 UA 模拟真实扫码
+    mobile_headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/116.0.0.0 Mobile Safari/537.36"
+    }
+    deep_request(session, "GET", url, "标准扫码(手机UA)", headers=mobile_headers)
+
+    # ====== 测试 2: 桌面 UA ======
+    deep_request(session, "GET", url, "桌面UA签到")
+
+    # ====== 测试 3: 不带 Cookie 的裸请求 ======
+    bare_session = requests.Session()
+    bare_session.headers.update({"User-Agent": mobile_headers["User-Agent"]})
+    deep_request(bare_session, "GET", url, "无Cookie裸请求")
+
+    # ====== 测试 4: POST 方式 ======
+    deep_request(session, "POST", url, "POST方式",
+                 json={"c": params.get("c",""), "t": params.get("t",""),
+                       "s": params.get("s",""), "v": params.get("v","")})
+
+    # ====== 测试 5: 拆分参数调用 checkin 接口 ======
+    if params.get("c"):
+        deep_request(session, "POST", f"{BASE}/api/v3/lesson/checkin",
+                     "用QR参数走checkin接口",
+                     json={"source": 14, "ticket": params.get("c",""),
+                           "t": params.get("t",""), "s": params.get("s","")})
+
+    # ====== 测试 6: 修改时间戳测试容错 ======
+    if params.get("t") and params.get("s"):
+        t_orig = int(params["t"])
+        # 用原始 t-3000ms（往前挪 3 秒）
+        modified_url = url.replace(f"t={params['t']}", f"t={t_orig - 3000}")
+        deep_request(session, "GET", modified_url, "时间戳-3s测试")
+
+    # ====== 测试 7: 去掉 s 参数 ======
+    nosig_url = url.split("&s=")[0] + "&v=2" if "&s=" in url else url
+    deep_request(session, "GET", nosig_url, "去掉签名s")
+
+
+def run_extra_probes(session, lesson_id):
+    """额外的 API 探测"""
+    if not lesson_id:
+        return
+
+    log_separator("额外 API 探测")
+
+    deep_request(session, "GET",
+                 f"{BASE}/api/v3/lesson/fetch-dynamic-invitation",
+                 "拉取动态码(学生身份)", params={"v": 2})
+
+    deep_request(session, "GET",
+                 f"{BASE}/api/v3/lesson/get-invitation",
+                 "拉取邀请码")
+
+    deep_request(session, "GET",
+                 f"{BASE}/api/v3/connection/get-token",
+                 "获取连接Token")
+
+    deep_request(session, "POST",
+                 f"{BASE}/api/v3/lesson/checkin",
+                 "source=1直签",
+                 json={"lessonId": lesson_id, "source": 1})
+
+
+# ==================== 监控模式 ====================
+
+def watch_mode(session, folder):
+    """监控文件夹中的新截图"""
+    log(f"📂 监控模式: {folder}", "WATCH")
+    processed = set()
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+        for f in glob.glob(os.path.join(folder, ext)):
+            processed.add(f)
+    log(f"  跳过 {len(processed)} 个已存在文件", "WATCH")
+
+    while True:
+        try:
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+                for f in sorted(glob.glob(os.path.join(folder, ext))):
+                    if f not in processed:
+                        processed.add(f)
+                        log(f"\n📷 新图片: {os.path.basename(f)}", "WATCH")
+                        url = decode_qr(f)
+                        if url and "dynamic-qr-code" in url:
+                            params = deep_analyze_url(url)
+                            run_checkin_analysis(session, url, params)
+            time.sleep(1)
+        except KeyboardInterrupt:
+            log("退出监控", "WATCH")
+            break
+
+
+# ==================== 主流程 ====================
+
+def main():
+    parser = argparse.ArgumentParser(description="雨课堂动态二维码签到深度分析工具")
+    parser.add_argument("image", nargs="?", help="二维码截图路径")
+    parser.add_argument("--url", help="直接传入二维码 URL")
+    parser.add_argument("--watch", metavar="FOLDER", help="监控文件夹中的新截图")
+    args = parser.parse_args()
+
+    if not args.image and not args.url and not args.watch:
+        parser.print_help()
+        print("\n示例:")
+        print("  python3 test_checkin_bypass.py qr_photo.jpg")
+        print('  python3 test_checkin_bypass.py --url "https://changjiang.yuketang.cn/api/v3/..."')
+        print("  python3 test_checkin_bypass.py --watch ~/Screenshots/")
+        sys.exit(1)
+
+    log_separator("雨课堂动态二维码签到深度分析工具")
+    log(f"报告文件: {REPORT_FILE}")
+
+    # 加载 Session
+    session, state = load_session()
+
+    # 验证登录
+    log_separator("登录验证")
+    r, body = deep_request(session, "GET",
+                           f"{BASE}/api/v3/user/basic-info", "身份验证")
+    if not (body and body.get("code") == 0):
+        log("Cookie 无效，退出", "ERROR")
+        sys.exit(1)
+
+    uid = body["data"]["id"]
+    log(f"已登录: {body['data'].get('name')} (UID: {uid})", "AUTH")
+
+    # 获取活跃课堂
+    log_separator("课堂探测")
+    r, body = deep_request(session, "GET",
+                           f"{BASE}/api/v3/classroom/on-lesson-upcoming-exam",
+                           "活跃课堂")
+    lesson_id = None
+    if body and body.get("code") == 0:
+        active = body.get("data", {}).get("onLessonClassrooms", [])
+        if active:
+            lesson_id = str(active[0]["lessonId"])
+            log(f"★ 活跃课堂: {active[0].get('courseName','')} (ID={lesson_id})", "FACT")
+
+    # 监控模式
+    if args.watch:
+        watch_mode(session, args.watch)
+        return
+
+    # 获取 URL
+    if args.url:
+        url = args.url
+    else:
+        log_separator("二维码解码")
+        url = decode_qr(args.image)
+        if not url:
+            sys.exit(1)
+
+    # 深度分析 URL
+    params = deep_analyze_url(url)
+
+    # 签到测试
+    log_separator("签到流程深度分析")
+    run_checkin_analysis(session, url, params)
+
+    # 额外探测
+    run_extra_probes(session, lesson_id)
+
+    # 生成总结
+    log_separator("分析完成")
+    log(f"详细报告已保存到: {REPORT_FILE}")
+    log(f"请将此文件发给 AI 分析，寻找突破方向。")
 
 
 if __name__ == "__main__":
-    logger("=" * 60)
-    logger(" 雨课堂签到协议深度诊断工具 V5 (整合版) ")
-    logger("=" * 60)
-
-    dbg = YKT_Debugger()
-    if not dbg.get_active_lesson():
-        logger("退出监听引擎。", "SYS")
-        sys.exit(0)
-
-    dbg.obtain_lesson_token()
-    dbg.start_ws()
-
-    # 首轮空发，试探报错点并确立上下文
-    dbg.run_api_probes()
-
-    logger(f"引擎休眠进入深度监听，有效期 300 秒...", "SYS")
-    logger(f"所有诊断输出将重定向至 -> {LOG_FILE}", "SYS")
-    try:
-        for i in range(300):
-            time.sleep(1)
-            if i % 30 == 0 and i > 0:
-                conn_status = "在线" if dbg.ws_connected else "离线"
-                auth_status = "已验证" if dbg.ws_hello_ok else "未验证"
-                logger(f"心跳探测 | WS: {conn_status}/{auth_status} | 监听结束倒数: {300 - i}s", "HEARTBEAT")
-    except KeyboardInterrupt:
-        logger("通过中断机制安全回收...", "SYS")
-
-    if dbg.ws: dbg.ws.close()
-    logger("侦听引擎释放。请查看最新日志文件。")
+    main()
