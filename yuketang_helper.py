@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -15,6 +16,7 @@ CHECKIN_COOLDOWN_MINUTES = 15           # 签到冷却时长 （分钟）
 SCHEDULE_INTERVAL_SECONDS = 20          # 持续检测间隔（秒）
 SCHEDULE_TIMEOUT_MINUTES = 30           # 首轮超时时间（分钟）
 SCHEDULE_EXTENSION_MINUTES = 15         # 每次超时后追加等待时间（分钟）
+THROTTLED_LOG_INTERVAL_SECONDS = 300    # 同类重复日志节流窗口（秒）
 
 PUSHPLUS_TOKEN = ""                     # 留空则关闭推送
 PUSHPLUS_CHANNEL = "wechat"             # wechat / mail / webhook / cp / sms
@@ -89,6 +91,31 @@ class YuketangHelper:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": GLOBAL_UA})
+        self._throttled_logs = {}
+        self._last_active_lesson_state = "unknown"
+
+    def _normalize_log_key(self, value):
+        return re.sub(r"0x[0-9a-fA-F]+", "0x*", str(value)).strip()
+
+    def _log_throttled(self, key, message, interval_seconds=THROTTLED_LOG_INTERVAL_SECONDS):
+        now = time.time()
+        entry = self._throttled_logs.get(key)
+        if not entry:
+            self._throttled_logs[key] = {"last_logged_at": now, "suppressed": 0}
+            log(message)
+            return
+
+        if now - entry["last_logged_at"] >= interval_seconds:
+            suppressed = entry["suppressed"]
+            entry["last_logged_at"] = now
+            entry["suppressed"] = 0
+            if suppressed > 0:
+                log(f"{message}（同类日志已抑制 {suppressed} 次）")
+            else:
+                log(message)
+            return
+
+        entry["suppressed"] += 1
 
     def _load_state(self):
         return load_state_dict()
@@ -386,10 +413,12 @@ class YuketangHelper:
             resp = self._desktop_request("get", "/api/v3/classroom/on-lesson-upcoming-exam", timeout=10)
             data = resp.json()
             if data.get("code") != 0:
+                message = f"获取课堂列表失败: {data.get('msg')}"
                 return {
                     "state": "error",
                     "log_prefix": "[-]",
-                    "message": f"获取课堂列表失败: {data.get('msg')}",
+                    "message": message,
+                    "log_key": f"active_lesson_error:{self._normalize_log_key(message)}",
                     "lesson_id": None,
                     "classroom_id": None,
                 }
@@ -411,18 +440,26 @@ class YuketangHelper:
                 "classroom_id": classroom.get("classroomId"),
             }
         except Exception as e:
+            message = f"获取课堂列表异常: {e}"
             return {
                 "state": "error",
                 "log_prefix": "[!]",
-                "message": f"获取课堂列表异常: {e}",
+                "message": message,
+                "log_key": f"active_lesson_error:{self._normalize_log_key(message)}",
                 "lesson_id": None,
                 "classroom_id": None,
             }
 
     def get_active_lesson_data(self):
         result = self._fetch_active_lesson_result()
+        self._last_active_lesson_state = result["state"]
         if result["state"] == "error":
-            log(f"{result['log_prefix']} {result['message']}")
+            message = f"{result['log_prefix']} {result['message']}"
+            log_key = result.get("log_key")
+            if log_key:
+                self._log_throttled(log_key, message)
+            else:
+                log(message)
         if result["state"] != "active":
             return None, None
         return result["lesson_id"], result["classroom_id"]
@@ -475,7 +512,12 @@ class YuketangHelper:
 
     def sign_in(self, lesson_id, classroom_id=None, source=1):
         result = self._perform_sign_in(lesson_id, classroom_id=classroom_id, source=source)
-        log(f"{result['log_prefix']} {result['message']}")
+        message = f"{result['log_prefix']} {result['message']}"
+        if result["success"]:
+            log(message)
+        else:
+            log_key = f"sign_in:{lesson_id}:{result['state']}:{self._normalize_log_key(result['message'])}"
+            self._log_throttled(log_key, message)
         return result["success"]
 
     def auto_sign_once(self, emit_log=True):
@@ -539,9 +581,15 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
                 if helper.sign_in(lesson_id, classroom_id=classroom_id):
                     log("[+] 已签到成功，结束持续签到")
                     return 0
-                log(f"[-] 课堂 {lesson_id} 本次未签到成功，继续重试...")
-            else:
-                log(f"[-] 当前没有正在进行的课堂，{interval_seconds} 秒后重试...")
+                helper._log_throttled(
+                    f"sign_retry_wait:{lesson_id}",
+                    f"[-] 课堂 {lesson_id} 本次未签到成功，继续重试...",
+                )
+            elif helper._last_active_lesson_state != "error":
+                helper._log_throttled(
+                    "waiting_no_active_lesson",
+                    f"[-] 当前没有正在进行的课堂，{interval_seconds} 秒后重试...",
+                )
 
             if datetime.now() >= deadline:
                 deadline = datetime.now() + timedelta(minutes=extension_minutes)
