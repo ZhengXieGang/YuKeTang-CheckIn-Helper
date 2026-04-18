@@ -69,6 +69,12 @@ class AnalysisError(RuntimeError):
     pass
 
 
+class DesktopLoginNeedCode(AnalysisError):
+    def __init__(self, message: str, need_code_token: str) -> None:
+        super().__init__(message)
+        self.need_code_token = need_code_token
+
+
 class RainClassroomAnalyzer:
     def __init__(
         self,
@@ -549,6 +555,14 @@ class RainClassroomAnalyzer:
                         raise AnalysisError("登录已取消")
                     wait_message = wait_body.get("msg") or wait_body.get("message")
                     wait_code = wait_body.get("code")
+                    if wait_code == 0:
+                        wait_data = wait_body.get("data") or {}
+                        need_code_token = str(wait_data.get("token") or "").strip()
+                        if need_code_token:
+                            raise DesktopLoginNeedCode(
+                                wait_message or "扫码成功，需要输入验证码",
+                                need_code_token=need_code_token,
+                            )
                     if wait_code in (500, 50000, 50001):
                         raise AnalysisError(f"二维码已失效: {wait_message or wait_code}")
                     if wait_message and wait_message != last_status:
@@ -593,6 +607,42 @@ class RainClassroomAnalyzer:
                 chunk = min(0.2, poll_interval_seconds - slept)
                 time.sleep(chunk)
                 slept += chunk
+
+    def submit_desktop_login_code(
+        self,
+        need_code_token: str,
+        verify_code: str,
+        desktop_cookies: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        token = str(need_code_token or "").strip()
+        code = str(verify_code or "").strip()
+        if not token:
+            raise AnalysisError("验证码登录缺少 token")
+        if len(code) != 4 or not code.isdigit():
+            raise AnalysisError("验证码必须是 4 位数字")
+
+        session = self.create_desktop_session()
+        self._apply_cookie_records(session, desktop_cookies or [])
+        _, body = self._fetch_desktop_json(
+            session,
+            "post",
+            "/api/v3/user/login/login-with-code",
+            json={
+                "token": token,
+                "code": code,
+            },
+            timeout=(8, 20),
+        )
+        if body.get("code") != 0:
+            message = body.get("msg") or body.get("message") or f"code={body.get('code')}"
+            raise AnalysisError(f"验证码登录失败: {message}")
+
+        user_info = self.validate_session(session)
+        self.save_session_state(session, existing_state=self.read_state(silent=True))
+        return {
+            "user_info": user_info,
+            "session_state": self.read_state(silent=True),
+        }
 
     def load_session(self) -> requests.Session:
         state = self.read_state()
