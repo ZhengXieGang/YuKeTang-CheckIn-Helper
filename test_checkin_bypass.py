@@ -570,6 +570,8 @@ class RainClassroomAnalyzer:
                         last_status = wait_message
                 except requests.ReadTimeout:
                     pass
+                except requests.RequestException as exc:
+                    self.log(f"wait-for-scan 网络异常，稍后重试: {exc}", "WARN")
                 except AnalysisError:
                     raise
                 except Exception as exc:
@@ -583,6 +585,13 @@ class RainClassroomAnalyzer:
                     timeout=request_timeout,
                 )
             except requests.ReadTimeout:
+                continue
+            except requests.RequestException as exc:
+                message = f"登录轮询网络异常，稍后重试: {exc}"
+                if message != last_status:
+                    self.log(message, "WARN")
+                    last_status = message
+                time.sleep(min(1.5, poll_interval_seconds or 1.0))
                 continue
             if stop_event and stop_event.is_set():
                 raise AnalysisError("登录已取消")
@@ -623,16 +632,33 @@ class RainClassroomAnalyzer:
 
         session = self.create_desktop_session()
         self._apply_cookie_records(session, desktop_cookies or [])
-        _, body = self._fetch_desktop_json(
-            session,
-            "post",
-            "/api/v3/user/login/login-with-code",
-            json={
-                "token": token,
-                "code": code,
-            },
-            timeout=(8, 20),
-        )
+        attempts = 4
+        body: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                _, body = self._fetch_desktop_json(
+                    session,
+                    "post",
+                    "/api/v3/user/login/login-with-code",
+                    json={
+                        "token": token,
+                        "code": code,
+                    },
+                    timeout=(8, 20),
+                )
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    raise AnalysisError(f"验证码登录网络异常: {exc}") from exc
+                self.log(
+                    f"验证码登录网络异常，重试 {attempt}/{attempts - 1}: {exc}",
+                    "WARN",
+                )
+                time.sleep(min(2.0, 0.5 * attempt))
+        if body is None:
+            raise AnalysisError(f"验证码登录失败: {last_error or '未知网络错误'}")
         if body.get("code") != 0:
             message = body.get("msg") or body.get("message") or f"code={body.get('code')}"
             raise AnalysisError(f"验证码登录失败: {message}")
