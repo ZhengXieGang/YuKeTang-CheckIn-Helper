@@ -11,7 +11,7 @@
 - **会话保活**：定期刷新 Session，防止过期掉线
 - **成功推送**：签到成功后可通过 PushPlus 推送提醒
 - **持续重试**：启动后持续运行；到达超时点自动追加等待时间，直到签到成功
-- **动态码签到（测试）**：独立测试脚本 `test_checkin_bypass.py` 可自动探测多种签到路径
+- **动态码签到（测试）**：独立测试脚本 `test_checkin_bypass.py` 可自动探测多种签到路径，搭配仓库内附带的安装包，方便快捷的抓取签到日志进行分析。
 
 ## 环境要求
 `yuketang_helper.py`：
@@ -103,6 +103,7 @@ python yuketang_helper.py -s 5
 |------|------|
 | `yuketang_helper.py` | 桌面端登录版主程序（签到、保活、持续重试、推送） |
 | `yuketang_helper_web.py` | Web 账密登录版主程序（签到、保活、持续重试、推送） |
+| `yktmobile-0.0.2-debug.apk` | 仓库内附带的 Android 测试安装包，可直接安装体验移动端扫码分析工具 |
 | `yuketang_session.json` | 桌面端持久化状态文件（Cookie + 签到记录），自动生成 |
 | `yuketang_session_web.json` | Web 版持久化状态文件（Cookie + 签到记录），自动生成 |
 

@@ -2,456 +2,1303 @@
 """
 雨课堂动态二维码签到深度分析工具
 
-用途：解析动态二维码 → 执行签到 → 抓取所有 HTTP 细节 → 生成详细报告
-用法：
-  python3 test_checkin_bypass.py <二维码图片>
-  python3 test_checkin_bypass.py --url "https://changjiang.yuketang.cn/api/v3/..."
-  python3 test_checkin_bypass.py --watch ~/Screenshots/
+用法:
+  python3 test_checkin_bypass.py qr.png
+  python3 test_checkin_bypass.py -url "https://changjiang.yuketang.cn/api/v3/..."
+  python3 test_checkin_bypass.py -watch ~/Screenshots
 """
 
+from __future__ import annotations
+
+import argparse
+import base64
 import json
-import time
 import os
 import sys
-import argparse
-import glob
-import hashlib
-import base64
+import threading
+import time
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs, urlencode
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
 try:
     import cv2
+
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
 
-SESSION_FILE = "yuketang_session.json"
-BASE = "https://changjiang.yuketang.cn"
-ts = datetime.now().strftime('%H%M%S')
-REPORT_FILE = f"qr_report_{ts}.log"
+GLOBAL_UA = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Mobile Safari/537.36"
+)
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
+DESKTOP_HEADERS = {
+    "xtbz": "ykt",
+    "desktop-v": "v2",
+    "X-Client": "desktop",
+    "Origin": "file://",
+}
+DEFAULT_BASE_DOMAIN = "changjiang.yuketang.cn"
+KNOWN_BASE_DOMAINS = (
+    "changjiang.yuketang.cn",
+    "huanghe.yuketang.cn",
+    "pro.yuketang.cn",
+    "yuketang.cn",
+)
+SESSION_COOKIE_NAMES = ("sessionid", "sid", "csrftoken")
+DEFAULT_ANALYSIS_SCRIPT = """from __future__ import annotations
 
-# ==================== 日志 ====================
 
-def log(msg, tag="INFO"):
-    line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:12]}] [{tag}] {msg}"
-    print(line, flush=True)
-    with open(REPORT_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+def run_analysis(analyzer, session, url: str, params: dict, lesson_id) -> None:
+    analyzer.log_separator("签到流程深度分析")
+    analyzer.run_checkin_analysis(session, url, params, lesson_id=lesson_id)
+    analyzer.run_extra_probes(session, lesson_id=lesson_id, params=params)
+"""
 
-def log_separator(title=""):
-    log("=" * 60)
-    if title:
-        log(f" {title}")
-        log("=" * 60)
 
-def dump_dict(d, indent=2):
-    """漂亮打印字典到日志"""
-    for line in json.dumps(d, ensure_ascii=False, indent=indent).split("\n"):
-        log(f"  {line}", "DATA")
+class AnalysisError(RuntimeError):
+    pass
 
-# ==================== Session 加载 ====================
 
-def load_session():
-    with open(SESSION_FILE, "r", encoding="utf-8") as f:
-        state = json.load(f)
+class RainClassroomAnalyzer:
+    def __init__(
+        self,
+        session_file: os.PathLike[str] | str = "yuketang_session.json",
+        base_domain: str | None = None,
+        report_dir: os.PathLike[str] | str = "reports",
+        log_callback: Callable[[str], None] | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        self.session_file = Path(session_file)
+        self.log_callback = log_callback
+        self.timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.report_dir = Path(report_dir)
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.report_file = self.report_dir / f"qr_report_{self.timestamp}.log"
+        self.active_context: dict[str, Any] = {}
 
-    s = requests.Session()
-    jwt = state.get("desktop_auth", "")
+        state = self.read_state(silent=True)
+        inferred_domain = base_domain or state.get("base_domain")
+        if not inferred_domain:
+            cookie_records = self._normalize_cookie_records(state)
+            if cookie_records:
+                inferred_domain = cookie_records[0].get("domain")
+        self.base_domain = (inferred_domain or DEFAULT_BASE_DOMAIN).strip()
+        self.base_url = self._build_base_url(self.base_domain)
 
-    for c in state.get("desktop_cookies", []):
-        s.cookies.set(c["name"], c["value"],
-                      domain=c.get("domain", "changjiang.yuketang.cn"),
-                      path=c.get("path", "/"))
+    def _build_base_url(self, domain_or_url: str) -> str:
+        text = (domain_or_url or DEFAULT_BASE_DOMAIN).strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            return text.rstrip("/")
+        return f"https://{text.rstrip('/')}"
 
-    s.headers.update({
-        "xtbz": "ykt",
-        "X-Client": "desktop",
-        "desktop-v": "v2",
-    })
-    if jwt:
-        s.headers["Authorization"] = f"Bearer {jwt}"
+    def sync_base_domain_from_url(self, url: str) -> None:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return
+        host = parsed.netloc.strip()
+        if host.endswith(".local"):
+            return
+        self.base_domain = host
+        self.base_url = f"{parsed.scheme}://{host}"
 
-    return s, state
+    def log(self, message: str, tag: str = "INFO") -> None:
+        line = f"[{datetime.now().strftime('%H:%M:%S.%f')[:12]}] [{tag}] {message}"
+        print(line, flush=True)
+        if self.log_callback:
+            self.log_callback(line)
+        with self.report_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
-# ==================== 二维码解码 ====================
+    def log_separator(self, title: str = "") -> None:
+        self.log("=" * 60)
+        if title:
+            self.log(f" {title}")
+            self.log("=" * 60)
 
-def decode_qr(image_path):
-    if not HAS_CV2:
-        log("需要 opencv-python: pip install opencv-python", "ERROR")
-        return None
-    if not os.path.exists(image_path):
-        log(f"文件不存在: {image_path}", "ERROR")
-        return None
+    def dump_dict(self, payload: Any, indent: int = 2) -> None:
+        for line in json.dumps(payload, ensure_ascii=False, indent=indent).splitlines():
+            self.log(f"  {line}", "DATA")
 
-    img = cv2.imread(image_path)
-    if img is None:
-        log(f"无法读取图片: {image_path}", "ERROR")
-        return None
-
-    detector = cv2.QRCodeDetector()
-    urls = []
-
-    # 原图尝试
-    data, _, _ = detector.detectAndDecode(img)
-    if data:
-        urls.append(data)
-
-    # WeChat 检测器
-    if not urls and hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+    def read_state(self, silent: bool = False) -> dict[str, Any]:
+        if not self.session_file.exists():
+            if silent:
+                return {}
+            raise AnalysisError(f"会话文件不存在: {self.session_file}")
         try:
-            wd = cv2.wechat_qrcode_WeChatQRCode()
-            results, _ = wd.detectAndDecode(img)
-            urls.extend([r for r in results if r])
-        except:
-            pass
+            state = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            if silent:
+                return {}
+            raise AnalysisError(f"读取会话文件失败: {exc}") from exc
+        if not isinstance(state, dict):
+            if silent:
+                return {}
+            raise AnalysisError("会话 JSON 顶层必须是对象")
+        return state
 
-    # 多尺度
-    if not urls:
-        for scale in [0.5, 1.5, 2.0]:
-            h, w = img.shape[:2]
-            resized = cv2.resize(img, (int(w * scale), int(h * scale)))
-            data, _, _ = detector.detectAndDecode(resized)
-            if data:
-                urls.append(data)
-                break
+    def write_state(self, state: dict[str, Any]) -> None:
+        self.session_file.parent.mkdir(parents=True, exist_ok=True)
+        self.session_file.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    # 灰度增强
-    if not urls:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        data, _, _ = detector.detectAndDecode(binary)
-        if data:
-            urls.append(data)
+    def _coerce_timestamp(self, value: Any) -> int | None:
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            number = float(value)
+        except Exception:
+            return None
+        if number > 10_000_000_000:
+            number /= 1000
+        if number <= 0:
+            return None
+        return int(number)
 
-    if urls:
-        log(f"解码成功: {urls[0][:100]}...", "QR")
-        return urls[0]
-    log("二维码解码失败", "ERROR")
-    return None
+    def _format_timestamp(self, value: int | None) -> str:
+        if not value:
+            return "未知"
+        try:
+            return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "未知"
 
-# ==================== URL 深度解析 ====================
+    def get_session_status(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = dict(state or self.read_state(silent=True))
+        cookie_records = self._normalize_cookie_records(state)
+        token, _ = self._normalize_auth(state.get("desktop_auth"))
+        expiry_candidates = [
+            self._coerce_timestamp(cookie.get("expires"))
+            for cookie in cookie_records
+            if str(cookie.get("name") or "").lower() in {"sid", "sessionid"}
+        ]
+        expiry_candidates = [item for item in expiry_candidates if item]
+        expires_at = max(expiry_candidates) if expiry_candidates else None
+        now_ts = int(time.time())
+        expired = bool(expires_at and expires_at <= now_ts)
+        base_domain = (
+            state.get("base_domain")
+            or (cookie_records[0].get("domain") if cookie_records else "")
+            or self.base_domain
+        )
+        return {
+            "base_domain": str(base_domain or "").strip() or DEFAULT_BASE_DOMAIN,
+            "cookie_count": len(cookie_records),
+            "has_cookie": bool(cookie_records),
+            "has_auth": bool(token),
+            "expires_at": expires_at,
+            "expires_text": self._format_timestamp(expires_at),
+            "expired": expired,
+            "updated_at": state.get("desktop_cookies_updated_at")
+            or state.get("desktop_auth_updated_at")
+            or "",
+        }
 
-def deep_analyze_url(url):
-    """深度解析二维码 URL 的每一个参数"""
-    log_separator("URL 深度解析")
+    def format_session_status(self, state: dict[str, Any] | None = None) -> str:
+        status = self.get_session_status(state=state)
+        if not status["has_cookie"] and not status["has_auth"]:
+            return "未检测到可用会话"
+        parts = [f"域名 {status['base_domain']}"]
+        if status["has_auth"]:
+            parts.append("含 Authorization")
+        if status["expires_at"]:
+            expiry_prefix = "已过期" if status["expired"] else "本地 Cookie 预计到期"
+            parts.append(f"{expiry_prefix} {status['expires_text']}")
+        else:
+            parts.append("无显式过期时间")
+        return "，".join(parts)
 
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
+    def _normalize_cookie_domain(self, value: Any) -> str:
+        return str(value or "").strip().lstrip(".")
 
-    log(f"完整 URL: {url}", "URL")
-    log(f"协议: {parsed.scheme}", "URL")
-    log(f"主机: {parsed.netloc}", "URL")
-    log(f"路径: {parsed.path}", "URL")
-    log(f"参数数量: {len(params)}", "URL")
+    def _cookie_matches_base_domain(self, domain: Any) -> bool:
+        cookie_domain = self._normalize_cookie_domain(domain)
+        base_domain = self._normalize_cookie_domain(self.base_domain)
+        if not cookie_domain or not base_domain:
+            return True
+        return (
+            cookie_domain == base_domain
+            or base_domain.endswith(f".{cookie_domain}")
+            or cookie_domain.endswith(f".{base_domain}")
+        )
 
-    info = {}
-    for key, vals in params.items():
-        val = vals[0]
-        info[key] = val
-        log(f"  {key} = {val}", "PARAM")
+    def _cookie_sort_key(self, cookie: dict[str, Any]) -> tuple[int, int, int, int]:
+        domain = self._normalize_cookie_domain(cookie.get("domain"))
+        path = str(cookie.get("path") or "/")
+        return (
+            1 if domain == self._normalize_cookie_domain(self.base_domain) else 0,
+            1 if path == "/" else 0,
+            1 if bool(cookie.get("secure")) else 0,
+            1 if cookie.get("expires") else 0,
+        )
 
-        # c 参数分析
-        if key == "c":
-            log(f"    长度: {len(val)}", "PARAM")
-            log(f"    可能为 Base64URL 编码的课堂标识", "PARAM")
+    def _prune_cookie_records(self, cookie_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        kept: dict[str, dict[str, Any]] = {}
+        for item in cookie_records:
+            name = str(item.get("name") or "").strip().lower()
+            value = item.get("value")
+            if name not in SESSION_COOKIE_NAMES or value is None:
+                continue
+            if not self._cookie_matches_base_domain(item.get("domain")):
+                continue
+            normalized = {
+                "name": name,
+                "value": str(value),
+                "domain": self._normalize_cookie_domain(item.get("domain")) or self.base_domain,
+                "path": str(item.get("path") or "/"),
+                "expires": self._coerce_timestamp(item.get("expires")),
+                "secure": bool(item.get("secure", False)),
+            }
+            existing = kept.get(name)
+            if existing is None or self._cookie_sort_key(normalized) >= self._cookie_sort_key(existing):
+                kept[name] = normalized
+
+        order = {name: index for index, name in enumerate(SESSION_COOKIE_NAMES)}
+        return sorted(kept.values(), key=lambda item: order.get(item["name"], 99))
+
+    def _normalize_cookie_records(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        cookie_records: list[dict[str, Any]] = []
+        raw = state.get("desktop_cookies") or state.get("cookies") or []
+        if isinstance(raw, dict):
+            raw = [
+                {"name": key, "value": value}
+                for key, value in raw.items()
+                if isinstance(value, str)
+            ]
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = item.get("value")
+            if not name or value is None:
+                continue
+            expires = self._coerce_timestamp(
+                item.get("expires", item.get("expirationDate", item.get("expiry")))
+            )
+            cookie_records.append(
+                {
+                    "name": name,
+                    "value": str(value),
+                    "domain": self._normalize_cookie_domain(
+                        item.get("domain") or state.get("base_domain") or self.base_domain
+                    ),
+                    "path": str(item.get("path") or "/"),
+                    "expires": expires,
+                    "secure": bool(item.get("secure", False)),
+                }
+            )
+        legacy = {
+            "sessionid": state.get("sessionid"),
+            "csrftoken": state.get("csrftoken"),
+            "sid": state.get("sid"),
+        }
+        existing = {item["name"] for item in cookie_records}
+        for key, value in legacy.items():
+            if key in existing or not value:
+                continue
+            cookie_records.append(
+                {
+                    "name": key,
+                    "value": str(value),
+                    "domain": self._normalize_cookie_domain(state.get("base_domain") or self.base_domain),
+                    "path": "/",
+                    "expires": None,
+                    "secure": True,
+                }
+            )
+        return self._prune_cookie_records(cookie_records)
+
+    def _create_session(
+        self,
+        user_agent: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({"User-Agent": user_agent})
+        if extra_headers:
+            session.headers.update(extra_headers)
+        return session
+
+    def create_desktop_session(self) -> requests.Session:
+        session = self._create_session(DESKTOP_UA, DESKTOP_HEADERS)
+        session.headers.setdefault("Accept", "application/json, text/plain, */*")
+        session.headers.setdefault("Referer", f"{self.base_url}/")
+        return session
+
+    def _apply_cookie_records(
+        self,
+        session: requests.Session,
+        cookie_records: list[dict[str, Any]],
+    ) -> None:
+        for cookie in cookie_records:
+            name = str(cookie.get("name") or "").strip()
+            value = cookie.get("value")
+            if not name or value is None:
+                continue
+            kwargs = {
+                "domain": str(cookie.get("domain") or self.base_domain),
+                "path": str(cookie.get("path") or "/"),
+            }
+            expires = cookie.get("expires")
+            if expires:
+                kwargs["expires"] = expires
+            session.cookies.set(name, str(value), **kwargs)
+        self._sync_csrftoken_header(session)
+
+    def _sync_csrftoken_header(self, session: requests.Session) -> None:
+        csrftoken = session.cookies.get("csrftoken")
+        if csrftoken:
+            session.headers["X-CSRFToken"] = csrftoken
+
+    def _cookie_records_from_session(self, session: requests.Session) -> list[dict[str, Any]]:
+        cookie_records: list[dict[str, Any]] = []
+        for cookie in session.cookies:
+            cookie_records.append(
+                {
+                    "name": str(cookie.name).lower(),
+                    "value": cookie.value,
+                    "domain": self._normalize_cookie_domain(cookie.domain or self.base_domain),
+                    "path": cookie.path or "/",
+                    "expires": int(cookie.expires) if cookie.expires else None,
+                    "secure": bool(cookie.secure),
+                }
+            )
+        return self._prune_cookie_records(cookie_records)
+
+    def _normalize_auth(self, auth_value: str | None) -> tuple[str, str]:
+        raw = (auth_value or "").strip()
+        if not raw:
+            return "", ""
+        if raw.lower().startswith("bearer "):
+            token = raw[7:].strip()
+            return token, f"Bearer {token}" if token else ""
+        return raw, f"Bearer {raw}"
+
+    def build_session_state(
+        self,
+        session: requests.Session,
+        existing_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = dict(existing_state or {})
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cookie_records = self._cookie_records_from_session(session)
+        if cookie_records:
+            state["desktop_cookies"] = cookie_records
+            state["desktop_cookies_updated_at"] = now_text
+            state["base_domain"] = cookie_records[0].get("domain") or self.base_domain
+        else:
+            state.pop("desktop_cookies", None)
+            state.pop("desktop_cookies_updated_at", None)
+            state["base_domain"] = self.base_domain
+        for legacy_key in ("sessionid", "sid", "csrftoken", "cookies"):
+            state.pop(legacy_key, None)
+
+        token, header = self._normalize_auth(session.headers.get("Authorization"))
+        if token:
+            state["desktop_auth"] = token
+            state["desktop_auth_updated_at"] = now_text
+        elif "desktop_auth" in state:
+            state.pop("desktop_auth", None)
+            state.pop("desktop_auth_updated_at", None)
+        if header:
+            session.headers["Authorization"] = header
+        return state
+
+    def save_session_state(
+        self,
+        session: requests.Session,
+        existing_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self.build_session_state(session, existing_state=existing_state)
+        self.write_state(state)
+        return state
+
+    def _cookie_signature(self, session: requests.Session) -> tuple[Any, ...]:
+        return tuple(
+            sorted(
+                (
+                    cookie.name,
+                    cookie.value,
+                    cookie.domain or self.base_domain,
+                    cookie.path or "/",
+                    int(cookie.expires) if cookie.expires else None,
+                    bool(cookie.secure),
+                )
+                for cookie in session.cookies
+            )
+        )
+
+    def _update_auth_from_response(
+        self,
+        session: requests.Session,
+        response: requests.Response,
+    ) -> bool:
+        token, header = self._normalize_auth(response.headers.get("set-auth"))
+        if not token:
+            return False
+        if session.headers.get("Authorization") == header:
+            return False
+        session.headers["Authorization"] = header
+        return True
+
+    def _fetch_desktop_json(
+        self,
+        session: requests.Session,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> tuple[requests.Response, dict[str, Any]]:
+        url = path if path.startswith("http") else f"{self.base_url}{path}"
+        old_cookies = self._cookie_signature(session)
+        response = session.request(method, url, **kwargs)
+        auth_changed = self._update_auth_from_response(session, response)
+        self._sync_csrftoken_header(session)
+        if auth_changed or old_cookies != self._cookie_signature(session):
+            self.save_session_state(session, existing_state=self.read_state(silent=True))
+
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            snippet = response.text[:240].replace("\n", " ")
+            raise AnalysisError(f"{path} 返回非 JSON: {snippet}")
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise AnalysisError(f"{path} JSON 解析失败: {exc}") from exc
+        if not isinstance(body, dict):
+            raise AnalysisError(f"{path} 返回了非对象 JSON")
+        return response, body
+
+    def create_desktop_login_context(self) -> dict[str, Any]:
+        session = self.create_desktop_session()
+        _, body = self._fetch_desktop_json(
+            session,
+            "get",
+            "/api/v3/user/login/pre-info",
+            timeout=20,
+        )
+        if body.get("code") != 0:
+            raise AnalysisError(body.get("msg") or "获取登录二维码失败")
+        info = body.get("data") or {}
+        qr_content = info.get("qrContent")
+        login_token = info.get("token")
+        if not qr_content or not login_token:
+            raise AnalysisError("登录二维码响应缺少 qrContent 或 token")
+        return {
+            "login_token": login_token,
+            "qr_content": qr_content,
+            "desktop_cookies": self._cookie_records_from_session(session),
+            "base_domain": self.base_domain,
+        }
+
+    def _poll_login_endpoint(
+        self,
+        session: requests.Session,
+        path: str,
+        login_token: str,
+        timeout: tuple[float, float] = (10, 35),
+    ) -> dict[str, Any]:
+        _, body = self._fetch_desktop_json(
+            session,
+            "post",
+            path,
+            json={"token": login_token},
+            timeout=timeout,
+        )
+        return body
+
+    def wait_for_desktop_login(
+        self,
+        login_token: str,
+        desktop_cookies: list[dict[str, Any]] | None = None,
+        max_wait_seconds: float = 300,
+        poll_interval_seconds: float = 2,
+        stop_event: threading.Event | None = None,
+        request_timeout_seconds: float = 8,
+    ) -> dict[str, Any]:
+        session = self.create_desktop_session()
+        self._apply_cookie_records(session, desktop_cookies or [])
+        start = time.time()
+        last_status = None
+        wait_for_scan_enabled = True
+        request_timeout = (5, max(1, request_timeout_seconds))
+        while True:
+            if stop_event and stop_event.is_set():
+                raise AnalysisError("登录已取消")
+            if max_wait_seconds and time.time() - start > max_wait_seconds:
+                raise AnalysisError("等待微信确认登录超时")
+            if wait_for_scan_enabled:
+                try:
+                    wait_body = self._poll_login_endpoint(
+                        session,
+                        "/api/v3/user/login/wait-for-scan",
+                        login_token,
+                        timeout=request_timeout,
+                    )
+                    if stop_event and stop_event.is_set():
+                        raise AnalysisError("登录已取消")
+                    wait_message = wait_body.get("msg") or wait_body.get("message")
+                    wait_code = wait_body.get("code")
+                    if wait_code in (500, 50000, 50001):
+                        raise AnalysisError(f"二维码已失效: {wait_message or wait_code}")
+                    if wait_message and wait_message != last_status:
+                        self.log(f"扫码状态: {wait_message}", "AUTH")
+                        last_status = wait_message
+                except requests.ReadTimeout:
+                    pass
+                except AnalysisError:
+                    raise
+                except Exception as exc:
+                    wait_for_scan_enabled = False
+                    self.log(f"wait-for-scan 不可用，改用 login 轮询: {exc}", "WARN")
             try:
-                # 尝试 base64 解码
-                padded = val + "=" * (4 - len(val) % 4)
-                decoded = base64.urlsafe_b64decode(padded)
-                log(f"    Base64 解码 ({len(decoded)} bytes): {decoded.hex()}", "PARAM")
-            except:
-                log(f"    Base64 解码失败", "PARAM")
+                body = self._poll_login_endpoint(
+                    session,
+                    "/api/v3/user/login",
+                    login_token,
+                    timeout=request_timeout,
+                )
+            except requests.ReadTimeout:
+                continue
+            if stop_event and stop_event.is_set():
+                raise AnalysisError("登录已取消")
+            code = body.get("code")
+            message = body.get("msg") or body.get("message") or f"code={code}"
+            if code == 0:
+                user_info = self.validate_session(session)
+                self.save_session_state(session, existing_state=self.read_state(silent=True))
+                return {
+                    "user_info": user_info,
+                    "session_state": self.read_state(silent=True),
+                }
+            if code in (500, 50000, 50001):
+                raise AnalysisError(f"二维码已失效: {message}")
+            if message != last_status:
+                self.log(f"登录状态: {message}", "AUTH")
+                last_status = message
+            slept = 0.0
+            while slept < poll_interval_seconds:
+                if stop_event and stop_event.is_set():
+                    raise AnalysisError("登录已取消")
+                chunk = min(0.2, poll_interval_seconds - slept)
+                time.sleep(chunk)
+                slept += chunk
 
-        # t 参数分析
-        if key == "t":
+    def load_session(self) -> requests.Session:
+        state = self.read_state()
+        cookie_records = self._normalize_cookie_records(state)
+        if cookie_records:
+            self.base_domain = cookie_records[0].get("domain") or self.base_domain
+            self.base_url = self._build_base_url(self.base_domain)
+        elif state.get("base_domain"):
+            self.base_domain = str(state["base_domain"]).strip()
+            self.base_url = self._build_base_url(self.base_domain)
+
+        session = self.create_desktop_session()
+        self._apply_cookie_records(session, cookie_records)
+        token, header = self._normalize_auth(state.get("desktop_auth"))
+        if header:
+            session.headers["Authorization"] = header
+
+        if not cookie_records and not token:
+            raise AnalysisError(
+                f"会话文件里没有可用的 desktop_cookies / desktop_auth: {self.session_file}"
+            )
+        return session
+
+    def validate_session(self, session: requests.Session) -> dict[str, Any]:
+        _, body = self._fetch_desktop_json(
+            session,
+            "get",
+            "/api/v3/user/basic-info",
+            timeout=15,
+        )
+        if body.get("code") != 0:
+            raise AnalysisError(body.get("msg") or "会话验证失败")
+        user = body.get("data") or {}
+        self.log(
+            f"已登录: {user.get('name') or '未知用户'} (UID: {user.get('id')})",
+            "AUTH",
+        )
+        return user
+
+    def keep_alive_session(self) -> dict[str, Any]:
+        session = self.load_session()
+        user_info = self.validate_session(session)
+        state = self.read_state(silent=True)
+        self.save_session_state(session, existing_state=state)
+        return {
+            "user_info": user_info,
+            "session_state": self.read_state(silent=True),
+        }
+
+    def fetch_active_context(self, session: requests.Session) -> dict[str, Any]:
+        def extract_items(body: dict[str, Any]) -> list[dict[str, Any]]:
+            data = body.get("data") or {}
+            candidates: list[Any] = []
+            if isinstance(data, dict):
+                for key in ("onLessonClassrooms", "classrooms", "list", "lessonClassrooms"):
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        candidates.extend(value)
+                for key in ("classroom", "currentClassroom", "currentLesson"):
+                    value = data.get(key)
+                    if isinstance(value, dict):
+                        candidates.append(value)
+            elif isinstance(data, list):
+                candidates.extend(data)
+            return [item for item in candidates if isinstance(item, dict)]
+
+        for path in (
+            "/api/v3/classroom/on-lesson-upcoming-exam",
+            "/api/v3/classroom/on-lesson",
+        ):
+            _, body = self._fetch_desktop_json(
+                session,
+                "get",
+                path,
+                timeout=15,
+            )
+            if body.get("code") != 0:
+                continue
+            active = extract_items(body)
+            if not active:
+                continue
+            classroom = active[0] or {}
+            context = {
+                "lesson_id": self._first_value_by_keys(
+                    classroom,
+                    ("lessonId", "lesson_id", "currentLessonId"),
+                ),
+                "classroom_id": self._first_value_by_keys(
+                    classroom,
+                    ("classroomId", "classroom_id", "id"),
+                ),
+                "course_name": self._first_value_by_keys(
+                    classroom,
+                    ("courseName", "classroomName", "name"),
+                ),
+                "raw": classroom,
+            }
+            self.log(
+                f"活跃课堂: {context.get('course_name') or '未知课程'} "
+                f"(lessonId={context.get('lesson_id')}, classroomId={context.get('classroom_id')})",
+                "FACT",
+            )
+            return context
+        self.log("当前没有正在进行的课堂", "FACT")
+        return {}
+
+    def fetch_active_lesson_id(self, session: requests.Session) -> str | None:
+        context = self.fetch_active_context(session)
+        return str(context["lesson_id"]) if context.get("lesson_id") is not None else None
+
+    def deep_analyze_url(self, url: str) -> dict[str, Any]:
+        self.sync_base_domain_from_url(url)
+        self.log_separator("URL 深度解析")
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        info: dict[str, Any] = {}
+
+        self.log(f"完整 URL: {url}", "URL")
+        self.log(f"协议: {parsed.scheme}", "URL")
+        self.log(f"主机: {parsed.netloc}", "URL")
+        self.log(f"路径: {parsed.path}", "URL")
+        self.log(f"参数数量: {len(params)}", "URL")
+
+        for key, values in params.items():
+            value = values[0]
+            info[key] = value
+            self.log(f"  {key} = {value}", "PARAM")
+            if key == "c":
+                self.log(f"    长度: {len(value)}", "PARAM")
+                try:
+                    padded = value + ("=" * ((-len(value)) % 4))
+                    decoded = base64.urlsafe_b64decode(padded)
+                    preview = decoded.hex()
+                    if len(preview) > 120:
+                        preview = preview[:120] + "..."
+                    self.log(f"    Base64URL 解码: {preview}", "PARAM")
+                except Exception:
+                    self.log("    Base64URL 解码失败", "PARAM")
+            if key == "t":
+                try:
+                    t_ms = int(value)
+                    current_ms = int(time.time() * 1000)
+                    age_sec = (current_ms - t_ms) / 1000
+                    self.log(
+                        f"    时间: {datetime.fromtimestamp(t_ms / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')}",
+                        "PARAM",
+                    )
+                    self.log(f"    距今: {age_sec:.1f}s", "PARAM")
+                    if age_sec > 10:
+                        self.log("    可能已超过动态码时效窗口", "WARN")
+                    info["_age_sec"] = age_sec
+                except Exception:
+                    pass
+            if key == "s":
+                self.log(f"    签名长度: {len(value)}", "PARAM")
+                try:
+                    int(value, 16)
+                    self.log("    形态看起来像十六进制签名", "PARAM")
+                except Exception:
+                    self.log("    非十六进制签名", "PARAM")
+            if key == "v":
+                self.log(f"    版本号: {value}", "PARAM")
+
+        info["_host"] = parsed.netloc
+        info["_path"] = parsed.path
+        info["_full_url"] = url
+        return info
+
+    def deep_request(
+        self,
+        session: requests.Session,
+        method: str,
+        url: str,
+        label: str,
+        _depth: int = 0,
+        **kwargs: Any,
+    ) -> tuple[requests.Response | None, dict[str, Any] | None]:
+        target_url = url if url.startswith("http") else urljoin(f"{self.base_url}/", url.lstrip("/"))
+        self.log_separator(f"HTTP 请求: {label}")
+        self.log(f"→ {method.upper()} {target_url}", "REQ")
+
+        merged_headers = dict(session.headers)
+        if "headers" in kwargs and kwargs["headers"]:
+            merged_headers.update(kwargs["headers"])
+        self.log("→ 请求头:", "REQ")
+        for key, value in merged_headers.items():
+            value_text = str(value)
+            if len(value_text) > 220:
+                value_text = value_text[:220] + "..."
+            self.log(f"    {key}: {value_text}", "REQ")
+
+        if session.cookies:
+            self.log("→ Cookie:", "REQ")
+            for cookie in session.cookies:
+                preview = cookie.value if len(cookie.value) <= 40 else cookie.value[:40] + "..."
+                self.log(
+                    f"    {cookie.name}={preview} (domain={cookie.domain} path={cookie.path})",
+                    "REQ",
+                )
+
+        if "params" in kwargs and kwargs["params"] is not None:
+            self.log("→ Query:", "REQ")
+            self.dump_dict(kwargs["params"])
+        if "json" in kwargs and kwargs["json"] is not None:
+            self.log("→ Body (JSON):", "REQ")
+            self.dump_dict(kwargs["json"])
+        if "data" in kwargs and kwargs["data"] is not None:
+            self.log(f"→ Body (RAW): {kwargs['data']!r}", "REQ")
+
+        old_cookies = self._cookie_signature(session)
+        try:
+            response = session.request(
+                method,
+                target_url,
+                timeout=kwargs.pop("timeout", 15),
+                allow_redirects=False,
+                **kwargs,
+            )
+        except Exception as exc:
+            self.log(f"← 异常: {exc}", "ERROR")
+            return None, None
+
+        auth_changed = self._update_auth_from_response(session, response)
+        self._sync_csrftoken_header(session)
+        if auth_changed or old_cookies != self._cookie_signature(session):
+            self.save_session_state(session, existing_state=self.read_state(silent=True))
+
+        self.log(
+            f"← HTTP {response.status_code} ({response.elapsed.total_seconds():.3f}s)",
+            "RESP",
+        )
+        self.log("← 响应头:", "RESP")
+        for key, value in response.headers.items():
+            preview = value if len(value) <= 320 else value[:320] + "..."
+            self.log(f"    {key}: {preview}", "RESP")
+            if key.lower() in {"set-cookie", "set-auth", "location", "x-request-id"}:
+                self.log(f"    ★ 重要头: {key} = {value}", "KEY")
+
+        content_type = response.headers.get("Content-Type", "")
+        body: dict[str, Any] | None = None
+        if "application/json" in content_type:
             try:
-                t_ms = int(val)
-                t_sec = t_ms / 1000
-                dt = datetime.fromtimestamp(t_sec)
-                now_ms = int(time.time() * 1000)
-                age_ms = now_ms - t_ms
-                age_sec = age_ms / 1000
-                log(f"    时间戳(ms): {t_ms}", "PARAM")
-                log(f"    对应时间: {dt.strftime('%Y-%m-%d %H:%M:%S.%f')}", "PARAM")
-                log(f"    距今: {age_sec:.1f}s", "PARAM")
-                if age_sec > 10:
-                    log(f"    ⚠️ 已超过 6 秒有效期，签到可能失败", "PARAM")
-                info["_age_sec"] = age_sec
-                info["_t_ms"] = t_ms
-            except:
+                body = response.json()
+                self.log("← 响应体 (JSON):", "RESP")
+                self.dump_dict(body)
+            except Exception as exc:
+                self.log(f"← JSON 解析失败: {exc}; 内容: {response.text[:500]}", "RESP")
+        else:
+            text_preview = response.text[:500] if response.text else ""
+            if "text/html" in content_type:
+                self.log(f"← 响应体 (HTML, {len(response.text)} chars):", "RESP")
+            else:
+                self.log(
+                    f"← 响应体 ({content_type or 'unknown'}, {len(response.content)} bytes):",
+                    "RESP",
+                )
+            if text_preview:
+                self.log(f"    {text_preview}", "RESP")
+
+        if (
+            response.status_code in {301, 302, 303, 307, 308}
+            and _depth < 5
+            and response.headers.get("Location")
+        ):
+            redirect_url = urljoin(str(response.url), response.headers["Location"])
+            self.log(f"↳ 重定向到: {redirect_url}", "REDIRECT")
+            next_kwargs = {key: value for key, value in kwargs.items() if key not in {"json", "data"}}
+            return self.deep_request(
+                session,
+                "GET",
+                redirect_url,
+                f"{label}→重定向",
+                _depth=_depth + 1,
+                **next_kwargs,
+            )
+        return response, body
+
+    def _first_value_by_keys(self, payload: Any, keys: tuple[str, ...]) -> Any:
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if value not in (None, "", [], {}):
+                    return value
+            for value in payload.values():
+                found = self._first_value_by_keys(value, keys)
+                if found not in (None, "", [], {}):
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = self._first_value_by_keys(item, keys)
+                if found not in (None, "", [], {}):
+                    return found
+        return None
+
+    def run_checkin_analysis(
+        self,
+        session: requests.Session,
+        url: str,
+        params: dict[str, Any],
+        lesson_id: str | int | None = None,
+    ) -> None:
+        mobile_headers = {"User-Agent": GLOBAL_UA}
+        self.deep_request(session, "GET", url, "标准扫码(手机 UA)", headers=mobile_headers)
+        self.deep_request(session, "GET", url, "标准扫码(桌面会话)")
+
+        bare_session = self._create_session(GLOBAL_UA)
+        self.deep_request(bare_session, "GET", url, "无登录态裸请求")
+
+        self.deep_request(
+            session,
+            "POST",
+            url,
+            "实验性: 直接 POST 动态码 URL",
+            json={key: params.get(key, "") for key in ("c", "t", "s", "v")},
+        )
+
+        if params.get("c"):
+            # 组合 1：原版（不带 lessonId，source=14）
+            self.deep_request(
+                session,
+                "POST",
+                "/api/v3/lesson/checkin",
+                "实验性: 原版 POST checkin",
+                json={
+                    "source": 14,
+                    "ticket": params.get("c", ""),
+                    "t": params.get("t", ""),
+                    "s": params.get("s", ""),
+                },
+            )
+            
+            # 组合 2：补全 lessonId，各种 Source (5=小程序, 14=PC)
+            if lesson_id:
+                for src in [5, 14]:
+                    self.deep_request(
+                        session,
+                        "POST",
+                        "/api/v3/lesson/checkin",
+                        f"探索: 带 lessonId, Source={src}",
+                        json={
+                            "source": src,
+                            "lessonId": str(lesson_id),
+                            "ticket": params.get("c", ""),
+                            "t": params.get("t", ""),
+                            "s": params.get("s", ""),
+                        },
+                    )
+            
+            # 组合 3：猜测性短链端点，当前未在已解包客户端中检索到直证
+            if lesson_id:
+                self.deep_request(
+                    session,
+                    "POST",
+                    "/api/v3/lesson/notkn/checkin",
+                    "猜测性: notkn/checkin",
+                    json={
+                        "invite_code": params.get("c", ""),
+                        "ticket": params.get("c", ""),
+                        "t": params.get("t", ""),
+                        "s": params.get("s", ""),
+                        "source": 5,
+                        "lessonId": str(lesson_id),
+                    },
+                )
+
+        if params.get("t") and params.get("s"):
+            try:
+                original_t = int(params["t"])
+                modified_url = url.replace(f"t={params['t']}", f"t={original_t - 3000}", 1)
+                self.deep_request(session, "GET", modified_url, "时间戳 -3s 容错测试")
+            except Exception:
                 pass
 
-        # s 参数分析（签名）
-        if key == "s":
-            log(f"    长度: {len(val)} 字符 = {len(val)*4} bits", "PARAM")
-            try:
-                s_int = int(val, 16)
-                log(f"    十进制: {s_int}", "PARAM")
-                log(f"    这是服务端生成的 HMAC 签名，无法本地伪造", "PARAM")
-            except:
-                log(f"    非十六进制", "PARAM")
+        if "&s=" in url:
+            no_sig_url = url.split("&s=")[0]
+            if "v=" not in no_sig_url:
+                no_sig_url += "&v=2"
+            self.deep_request(session, "GET", no_sig_url, "去掉签名 s")
 
-    return info
+    def run_extra_probes(
+        self,
+        session: requests.Session,
+        lesson_id: str | int | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        params = params or {}
+        classroom_id = (self.active_context or {}).get("classroom_id")
+        if not lesson_id:
+            lesson_id = (self.active_context or {}).get("lesson_id")
 
-# ==================== HTTP 请求深度抓取 ====================
+        self.log_separator("桌面端接口探测")
+        self.deep_request(session, "GET", "/api/v3/connection/get-token", "连接 Token")
+        self.deep_request(session, "GET", "/api/v3/classroom/on-lesson", "进行中课堂(on-lesson)")
+        self.deep_request(session, "GET", "/api/v3/classroom/drop-down", "课堂下拉列表(drop-down)")
 
-def deep_request(session, method, url, label, **kwargs):
-    """发起请求并记录极致详细的 HTTP 交互"""
-    log_separator(f"HTTP 请求: {label}")
+        if classroom_id:
+            self.deep_request(
+                session,
+                "GET",
+                "/api/v3/classroom/basic-info",
+                "课堂基础信息(classroom/basic-info)",
+                params={"classroomId": classroom_id},
+            )
+            self.deep_request(
+                session,
+                "GET",
+                "/api/v3/classroom/branch-type",
+                "课堂分支类型(branch-type)",
+                params={"classroomId": classroom_id},
+            )
+            self.deep_request(
+                session,
+                "GET",
+                "/api/v3/classroom/lesson-config",
+                "课堂课程配置(lesson-config)",
+                params={"classroomId": classroom_id, "lessonId": lesson_id},
+            )
 
-    log(f"→ {method} {url}", "REQ")
+        if not lesson_id:
+            self.log("没有 lesson_id，跳过 lesson 相关探测", "WARN")
+            return
 
-    # 记录请求头
-    log("→ 请求头:", "REQ")
-    merged_headers = dict(session.headers)
-    if "headers" in kwargs:
-        merged_headers.update(kwargs["headers"])
-    for k, v in merged_headers.items():
-        # 截断过长的 header
-        v_str = str(v)
-        if len(v_str) > 200:
-            v_str = v_str[:200] + "..."
-        log(f"    {k}: {v_str}", "REQ")
+        lesson_id = str(lesson_id)
+        self.deep_request(
+            session,
+            "GET",
+            "/api/v3/lesson/basic-info",
+            "课堂基础信息(lesson/basic-info)",
+            params={"lessonId": lesson_id},
+        )
 
-    # 记录请求 Cookie
-    log("→ Cookie:", "REQ")
-    for c in session.cookies:
-        log(f"    {c.name}={c.value[:30]}... (domain={c.domain} path={c.path})", "REQ")
+        _response, body = self.deep_request(
+            session,
+            "GET",
+            "/api/v3/lesson/checkin-list",
+            "签到列表(checkin-list)",
+            params={"lessonId": lesson_id},
+        )
+        self.deep_request(
+            session,
+            "GET",
+            "/api/v3/lesson/uncheckin-list",
+            "未签到列表(uncheckin-list)",
+            params={"lessonId": lesson_id},
+        )
+        self.deep_request(
+            session,
+            "GET",
+            "/api/v3/lesson/get-invitation",
+            "邀请码(get-invitation)",
+            params={"lessonId": lesson_id},
+        )
+        self.deep_request(
+            session,
+            "GET",
+            "/api/v3/lesson/fetch-dynamic-invitation",
+            "动态码(fetch-dynamic-invitation)",
+            params={"lessonId": lesson_id, "v": params.get("v", 2)},
+        )
+        self.deep_request(
+            session,
+            "GET",
+            "/api/v3/vote-machine/get-vote-machine-list",
+            "设备侧投票机列表(get-vote-machine-list)",
+            params={"lessonId": lesson_id, "classroomId": classroom_id},
+        )
 
-    # 记录请求体
-    if "json" in kwargs:
-        log(f"→ Body (JSON):", "REQ")
-        dump_dict(kwargs["json"])
+        checkin_id = self._first_value_by_keys(body, ("checkinId", "id"))
+        if checkin_id not in (None, "", [], {}):
+            self.deep_request(
+                session,
+                "GET",
+                "/api/v3/lesson/checkin/detail",
+                "签到详情(checkin/detail)",
+                params={"lessonId": lesson_id, "checkinId": checkin_id},
+            )
+        if params.get("c") and params.get("t") and params.get("s"):
+            self.deep_request(
+                session,
+                "POST",
+                "/api/v3/vote-machine/lesson-check-in",
+                "实验性: 设备侧签到(vote-machine/lesson-check-in)",
+                json={
+                    "lessonId": lesson_id,
+                    "classroomId": classroom_id,
+                    "ticket": params.get("c"),
+                    "t": params.get("t"),
+                    "s": params.get("s"),
+                    "v": params.get("v", 2),
+                },
+            )
 
-    try:
-        # 关键：禁止自动重定向，手动跟踪每一步
-        r = session.request(method, url, timeout=15, allow_redirects=False, **kwargs)
-        elapsed = r.elapsed.total_seconds()
+    def run_with_workflow(
+        self,
+        url: str,
+        workflow: Callable[..., Any],
+    ) -> dict[str, Any]:
+        self.log_separator("雨课堂动态二维码签到深度分析工具")
+        self.log(f"会话文件: {self.session_file}")
+        self.sync_base_domain_from_url(url)
+        self.log(f"目标域名: {self.base_domain}")
 
-        log(f"← HTTP {r.status_code} ({elapsed:.3f}s)", "RESP")
+        session = self.load_session()
+        self.log_separator("登录验证")
+        user_info = self.validate_session(session)
 
-        # 记录所有响应头
-        log("← 响应头:", "RESP")
-        for k, v in r.headers.items():
-            log(f"    {k}: {v[:300]}", "RESP")
-            # 特别关注
-            if k.lower() in ["set-cookie", "set-auth", "location", "x-request-id"]:
-                log(f"    ★ 重要头: {k} = {v}", "KEY")
+        self.log_separator("课堂探测")
+        self.active_context = self.fetch_active_context(session)
 
-        # 记录 Set-Cookie
-        if r.cookies:
-            log("← 新 Cookie:", "RESP")
-            for c in r.cookies:
-                log(f"    {c.name}={c.value} (domain={c.domain} path={c.path})", "RESP")
+        params = self.deep_analyze_url(url)
+        workflow(self, session, url, params, self.active_context.get("lesson_id"))
 
-        # 响应体
-        ct = r.headers.get("Content-Type", "")
-        if "json" in ct:
-            try:
-                body = r.json()
-                log("← 响应体 (JSON):", "RESP")
-                dump_dict(body)
-                return r, body
-            except:
-                log(f"← 响应体 (JSON解析失败): {r.text[:500]}", "RESP")
-        elif "html" in ct:
-            log(f"← 响应体 (HTML, {len(r.text)} chars):", "RESP")
-            log(f"    {r.text[:500]}", "RESP")
-        else:
-            log(f"← 响应体 ({ct}, {len(r.content)} bytes):", "RESP")
-            log(f"    {r.text[:500]}", "RESP")
+        self.log_separator("分析完成")
+        self.log(f"详细报告已保存到: {self.report_file}")
+        return {
+            "report_file": str(self.report_file),
+            "user_info": user_info,
+            "lesson_id": self.active_context.get("lesson_id"),
+            "classroom_id": self.active_context.get("classroom_id"),
+            "params": params,
+        }
 
-        # 如果是重定向，手动跟踪
-        if r.status_code in [301, 302, 303, 307, 308]:
-            loc = r.headers.get("Location", "")
-            log(f"↳ 重定向到: {loc}", "REDIRECT")
-            if loc:
-                return deep_request(session, "GET", loc, f"{label}→重定向", **{
-                    k: v for k, v in kwargs.items() if k != "json"
-                })
 
-        return r, None
+def run_analysis(
+    analyzer: RainClassroomAnalyzer,
+    session,
+    url: str,
+    params: dict,
+    lesson_id,
+) -> None:
+    analyzer.log_separator("签到流程深度分析")
+    analyzer.run_checkin_analysis(session, url, params, lesson_id=lesson_id)
+    analyzer.run_extra_probes(session, lesson_id=lesson_id, params=params)
 
-    except Exception as e:
-        log(f"← 异常: {e}", "ERROR")
-        return None, None
 
-# ==================== 签到执行与变体测试 ====================
+def decode_qr(image_path: str) -> str | None:
+    if not HAS_CV2:
+        raise AnalysisError("缺少 opencv-python，无法从图片解码二维码")
+    if not os.path.exists(image_path):
+        raise AnalysisError(f"文件不存在: {image_path}")
 
-def run_checkin_analysis(session, url, params):
-    """用各种姿势尝试签到，对比服务器行为"""
+    image = cv2.imread(image_path)
+    if image is None:
+        raise AnalysisError(f"无法读取图片: {image_path}")
 
-    # ====== 测试 1: 原始 GET（标准扫码流程）======
-    # 用手机 UA 模拟真实扫码
-    mobile_headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/116.0.0.0 Mobile Safari/537.36"
+    detector = cv2.QRCodeDetector()
+    candidates: list[str] = []
+
+    data, _, _ = detector.detectAndDecode(image)
+    if data:
+        candidates.append(data)
+
+    if not candidates and hasattr(cv2, "wechat_qrcode_WeChatQRCode"):
+        try:
+            decoder = cv2.wechat_qrcode_WeChatQRCode()
+            results, _ = decoder.detectAndDecode(image)
+            candidates.extend(item for item in results if item)
+        except Exception:
+            pass
+
+    if not candidates:
+        for scale in (0.5, 1.5, 2.0):
+            height, width = image.shape[:2]
+            resized = cv2.resize(image, (int(width * scale), int(height * scale)))
+            data, _, _ = detector.detectAndDecode(resized)
+            if data:
+                candidates.append(data)
+                break
+
+    if not candidates:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        data, _, _ = detector.detectAndDecode(binary)
+        if data:
+            candidates.append(data)
+
+    if not candidates:
+        raise AnalysisError("二维码解码失败")
+    return candidates[0]
+
+
+def analyze_single(
+    url: str,
+    base_domain: str | None = None,
+    session_file: str = "yuketang_session.json",
+    report_dir: str = "reports",
+) -> str:
+    analyzer = RainClassroomAnalyzer(
+        base_domain=base_domain,
+        session_file=session_file,
+        report_dir=report_dir,
+    )
+    result = analyzer.run_with_workflow(url, run_analysis)
+    return result["report_file"]
+
+
+def watch_mode(
+    folder: str,
+    base_domain: str | None = None,
+    session_file: str = "yuketang_session.json",
+    report_dir: str = "reports",
+) -> None:
+    watch_dir = Path(folder).expanduser()
+    if not watch_dir.exists():
+        raise AnalysisError(f"目录不存在: {watch_dir}")
+
+    print(f"监控目录: {watch_dir}")
+    processed = {
+        str(path)
+        for pattern in ("*.png", "*.jpg", "*.jpeg", "*.bmp")
+        for path in watch_dir.glob(pattern)
     }
-    deep_request(session, "GET", url, "标准扫码(手机UA)", headers=mobile_headers)
-
-    # ====== 测试 2: 桌面 UA ======
-    deep_request(session, "GET", url, "桌面UA签到")
-
-    # ====== 测试 3: 不带 Cookie 的裸请求 ======
-    bare_session = requests.Session()
-    bare_session.headers.update({"User-Agent": mobile_headers["User-Agent"]})
-    deep_request(bare_session, "GET", url, "无Cookie裸请求")
-
-    # ====== 测试 4: POST 方式 ======
-    deep_request(session, "POST", url, "POST方式",
-                 json={"c": params.get("c",""), "t": params.get("t",""),
-                       "s": params.get("s",""), "v": params.get("v","")})
-
-    # ====== 测试 5: 拆分参数调用 checkin 接口 ======
-    if params.get("c"):
-        deep_request(session, "POST", f"{BASE}/api/v3/lesson/checkin",
-                     "用QR参数走checkin接口",
-                     json={"source": 14, "ticket": params.get("c",""),
-                           "t": params.get("t",""), "s": params.get("s","")})
-
-    # ====== 测试 6: 修改时间戳测试容错 ======
-    if params.get("t") and params.get("s"):
-        t_orig = int(params["t"])
-        # 用原始 t-3000ms（往前挪 3 秒）
-        modified_url = url.replace(f"t={params['t']}", f"t={t_orig - 3000}")
-        deep_request(session, "GET", modified_url, "时间戳-3s测试")
-
-    # ====== 测试 7: 去掉 s 参数 ======
-    nosig_url = url.split("&s=")[0] + "&v=2" if "&s=" in url else url
-    deep_request(session, "GET", nosig_url, "去掉签名s")
-
-
-def run_extra_probes(session, lesson_id):
-    """额外的 API 探测"""
-    if not lesson_id:
-        return
-
-    log_separator("额外 API 探测")
-
-    deep_request(session, "GET",
-                 f"{BASE}/api/v3/lesson/fetch-dynamic-invitation",
-                 "拉取动态码(学生身份)", params={"v": 2})
-
-    deep_request(session, "GET",
-                 f"{BASE}/api/v3/lesson/get-invitation",
-                 "拉取邀请码")
-
-    deep_request(session, "GET",
-                 f"{BASE}/api/v3/connection/get-token",
-                 "获取连接Token")
-
-    deep_request(session, "POST",
-                 f"{BASE}/api/v3/lesson/checkin",
-                 "source=1直签",
-                 json={"lessonId": lesson_id, "source": 1})
-
-
-# ==================== 监控模式 ====================
-
-def watch_mode(session, folder):
-    """监控文件夹中的新截图"""
-    log(f"📂 监控模式: {folder}", "WATCH")
-    processed = set()
-    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
-        for f in glob.glob(os.path.join(folder, ext)):
-            processed.add(f)
-    log(f"  跳过 {len(processed)} 个已存在文件", "WATCH")
+    print(f"已跳过 {len(processed)} 个现有文件")
 
     while True:
         try:
-            for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
-                for f in sorted(glob.glob(os.path.join(folder, ext))):
-                    if f not in processed:
-                        processed.add(f)
-                        log(f"\n📷 新图片: {os.path.basename(f)}", "WATCH")
-                        url = decode_qr(f)
-                        if url and "dynamic-qr-code" in url:
-                            params = deep_analyze_url(url)
-                            run_checkin_analysis(session, url, params)
+            for pattern in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
+                for path in sorted(watch_dir.glob(pattern)):
+                    path_str = str(path)
+                    if path_str in processed:
+                        continue
+                    processed.add(path_str)
+                    print(f"\n新图片: {path.name}")
+                    try:
+                        qr_url = decode_qr(path_str)
+                        if qr_url:
+                            analyze_single(
+                                qr_url,
+                                base_domain=base_domain,
+                                session_file=session_file,
+                                report_dir=report_dir,
+                            )
+                    except Exception as exc:
+                        print(f"分析失败: {exc}")
             time.sleep(1)
         except KeyboardInterrupt:
-            log("退出监控", "WATCH")
-            break
+            print("已退出监控")
+            return
 
 
-# ==================== 主流程 ====================
-
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="雨课堂动态二维码签到深度分析工具")
     parser.add_argument("image", nargs="?", help="二维码截图路径")
-    parser.add_argument("--url", help="直接传入二维码 URL")
-    parser.add_argument("--watch", metavar="FOLDER", help="监控文件夹中的新截图")
+    parser.add_argument("-url", dest="url", help="直接传入动态二维码 URL")
+    parser.add_argument("-watch", dest="watch", metavar="FOLDER", help="监控文件夹里的新截图")
+    parser.add_argument(
+        "-base-domain",
+        dest="base_domain",
+        help="手动指定域名，如 changjiang.yuketang.cn",
+    )
+    parser.add_argument(
+        "-session-file",
+        dest="session_file",
+        default="yuketang_session.json",
+        help="会话 JSON 路径，默认 yuketang_session.json",
+    )
+    parser.add_argument(
+        "-report-dir",
+        dest="report_dir",
+        default="reports",
+        help="报告输出目录，默认 reports",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if not args.image and not args.url and not args.watch:
         parser.print_help()
         print("\n示例:")
         print("  python3 test_checkin_bypass.py qr_photo.jpg")
-        print('  python3 test_checkin_bypass.py --url "https://changjiang.yuketang.cn/api/v3/..."')
-        print("  python3 test_checkin_bypass.py --watch ~/Screenshots/")
-        sys.exit(1)
+        print('  python3 test_checkin_bypass.py -url "https://changjiang.yuketang.cn/api/v3/..."')
+        print("  python3 test_checkin_bypass.py -watch ~/Screenshots")
+        print("  python3 test_checkin_bypass.py -url \"...\" -session-file ./yuketang_session.json")
+        raise SystemExit(1)
 
-    log_separator("雨课堂动态二维码签到深度分析工具")
-    log(f"报告文件: {REPORT_FILE}")
-
-    # 加载 Session
-    session, state = load_session()
-
-    # 验证登录
-    log_separator("登录验证")
-    r, body = deep_request(session, "GET",
-                           f"{BASE}/api/v3/user/basic-info", "身份验证")
-    if not (body and body.get("code") == 0):
-        log("Cookie 无效，退出", "ERROR")
-        sys.exit(1)
-
-    uid = body["data"]["id"]
-    log(f"已登录: {body['data'].get('name')} (UID: {uid})", "AUTH")
-
-    # 获取活跃课堂
-    log_separator("课堂探测")
-    r, body = deep_request(session, "GET",
-                           f"{BASE}/api/v3/classroom/on-lesson-upcoming-exam",
-                           "活跃课堂")
-    lesson_id = None
-    if body and body.get("code") == 0:
-        active = body.get("data", {}).get("onLessonClassrooms", [])
-        if active:
-            lesson_id = str(active[0]["lessonId"])
-            log(f"★ 活跃课堂: {active[0].get('courseName','')} (ID={lesson_id})", "FACT")
-
-    # 监控模式
     if args.watch:
-        watch_mode(session, args.watch)
+        watch_mode(
+            args.watch,
+            base_domain=args.base_domain,
+            session_file=args.session_file,
+            report_dir=args.report_dir,
+        )
         return
 
-    # 获取 URL
-    if args.url:
-        url = args.url
-    else:
-        log_separator("二维码解码")
-        url = decode_qr(args.image)
-        if not url:
-            sys.exit(1)
-
-    # 深度分析 URL
-    params = deep_analyze_url(url)
-
-    # 签到测试
-    log_separator("签到流程深度分析")
-    run_checkin_analysis(session, url, params)
-
-    # 额外探测
-    run_extra_probes(session, lesson_id)
-
-    # 生成总结
-    log_separator("分析完成")
-    log(f"详细报告已保存到: {REPORT_FILE}")
-    log(f"请将此文件发给 AI 分析，寻找突破方向。")
+    try:
+        qr_url = args.url or decode_qr(args.image)
+        if not qr_url:
+            raise AnalysisError("没有可分析的二维码 URL")
+        report_file = analyze_single(
+            qr_url,
+            base_domain=args.base_domain,
+            session_file=args.session_file,
+            report_dir=args.report_dir,
+        )
+        print(f"报告已保存到: {report_file}")
+    except AnalysisError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":
