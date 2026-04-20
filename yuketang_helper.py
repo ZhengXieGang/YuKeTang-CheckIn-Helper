@@ -1047,7 +1047,7 @@ def ensure_login(helper, allow_interactive_login):
 def run_until_success(helper, delay_minutes=0, return_to_menu=False):
     interval_seconds = max(5, int(SCHEDULE_INTERVAL_SECONDS))
     timeout_minutes = max(1, int(SCHEDULE_TIMEOUT_MINUTES))
-    extension_minutes = max(1, int(SCHEDULE_EXTENSION_MINUTES))
+    extension_minutes = max(0, int(SCHEDULE_EXTENSION_MINUTES))
 
     if delay_minutes > 0:
         log(f"[*] 将在 {delay_minutes} 分钟后开始持续签到...")

@@ -366,6 +366,8 @@ class RainClassroomAnalyzer:
         csrftoken = session.cookies.get("csrftoken")
         if csrftoken:
             session.headers["X-CSRFToken"] = csrftoken
+        else:
+            session.headers.pop("X-CSRFToken", None)
 
     def _cookie_records_from_session(self, session: requests.Session) -> list[dict[str, Any]]:
         cookie_records: list[dict[str, Any]] = []
@@ -390,6 +392,14 @@ class RainClassroomAnalyzer:
             token = raw[7:].strip()
             return token, f"Bearer {token}" if token else ""
         return raw, f"Bearer {raw}"
+
+    def _set_session_auth(self, session: requests.Session, auth_value: str | None) -> bool:
+        token, header = self._normalize_auth(auth_value)
+        if header:
+            session.headers["Authorization"] = header
+        else:
+            session.headers.pop("Authorization", None)
+        return bool(token)
 
     def build_session_state(
         self,
@@ -418,7 +428,7 @@ class RainClassroomAnalyzer:
             state.pop("desktop_auth", None)
             state.pop("desktop_auth_updated_at", None)
         if header:
-            session.headers["Authorization"] = header
+            self._set_session_auth(session, header)
         return state
 
     def save_session_state(
@@ -450,13 +460,56 @@ class RainClassroomAnalyzer:
         session: requests.Session,
         response: requests.Response,
     ) -> bool:
-        token, header = self._normalize_auth(response.headers.get("set-auth"))
-        if not token:
+        old_header = session.headers.get("Authorization") or ""
+        candidates = [response, *(getattr(response, "history", []) or [])]
+        for item in candidates:
+            headers = getattr(item, "headers", {}) or {}
+            for key in ("set-auth", "Set-Auth", "authorization", "Authorization"):
+                value = headers.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                self._set_session_auth(session, value)
+                return (session.headers.get("Authorization") or "") != old_header
+        return False
+
+    @staticmethod
+    def _is_authenticated_basic_info(body: dict[str, Any] | None) -> bool:
+        if not isinstance(body, dict) or body.get("code") != 0:
             return False
-        if session.headers.get("Authorization") == header:
+        payload = body.get("data")
+        if not isinstance(payload, dict) or not payload:
             return False
-        session.headers["Authorization"] = header
-        return True
+        for key in ("id", "user_id", "userId", "name", "username"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    return True
+            elif value:
+                return True
+        return bool(payload)
+
+    @staticmethod
+    def _extract_verify_code_token(body: dict[str, Any] | None) -> str:
+        if not isinstance(body, dict):
+            return ""
+        direct_token = str(body.get("token") or "").strip()
+        if direct_token:
+            return direct_token
+        payload = body.get("data")
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("token", "verify_token", "verifyToken", "need_code_token", "needCodeToken"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _mask_secret(value: Any) -> str:
+        text = str(value or "")
+        if len(text) <= 12:
+            return "*" * len(text)
+        return f"{text[:6]}...{text[-4:]}"
 
     def _fetch_desktop_json(
         self,
@@ -553,16 +606,14 @@ class RainClassroomAnalyzer:
                     )
                     if stop_event and stop_event.is_set():
                         raise AnalysisError("登录已取消")
+                    verify_token = self._extract_verify_code_token(wait_body)
+                    if verify_token:
+                        raise DesktopLoginNeedCode(
+                            (wait_body.get("msg") or wait_body.get("message") or "扫码成功，需要输入验证码"),
+                            need_code_token=verify_token,
+                        )
                     wait_message = wait_body.get("msg") or wait_body.get("message")
                     wait_code = wait_body.get("code")
-                    if wait_code == 0:
-                        wait_data = wait_body.get("data") or {}
-                        need_code_token = str(wait_data.get("token") or "").strip()
-                        if need_code_token:
-                            raise DesktopLoginNeedCode(
-                                wait_message or "扫码成功，需要输入验证码",
-                                need_code_token=need_code_token,
-                            )
                     if wait_code in (500, 50000, 50001):
                         raise AnalysisError(f"二维码已失效: {wait_message or wait_code}")
                     if wait_message and wait_message != last_status:
@@ -595,6 +646,12 @@ class RainClassroomAnalyzer:
                 continue
             if stop_event and stop_event.is_set():
                 raise AnalysisError("登录已取消")
+            verify_token = self._extract_verify_code_token(body)
+            if verify_token:
+                raise DesktopLoginNeedCode(
+                    (body.get("msg") or body.get("message") or "扫码成功，需要输入验证码"),
+                    need_code_token=verify_token,
+                )
             code = body.get("code")
             message = body.get("msg") or body.get("message") or f"code={code}"
             if code == 0:
@@ -663,10 +720,9 @@ class RainClassroomAnalyzer:
             message = body.get("msg") or body.get("message") or f"code={body.get('code')}"
             raise AnalysisError(f"验证码登录失败: {message}")
 
-        user_info = self.validate_session(session)
         self.save_session_state(session, existing_state=self.read_state(silent=True))
         return {
-            "user_info": user_info,
+            "code_submitted": True,
             "session_state": self.read_state(silent=True),
         }
 
@@ -699,14 +755,57 @@ class RainClassroomAnalyzer:
             "/api/v3/user/basic-info",
             timeout=15,
         )
-        if body.get("code") != 0:
+        if not self._is_authenticated_basic_info(body):
             raise AnalysisError(body.get("msg") or "会话验证失败")
         user = body.get("data") or {}
+        token, _ = self._normalize_auth(session.headers.get("Authorization"))
+        auth_suffix = "，含 Authorization" if token else "，未带 Authorization"
         self.log(
-            f"已登录: {user.get('name') or '未知用户'} (UID: {user.get('id')})",
+            f"已登录: {user.get('name') or '未知用户'} (UID: {user.get('id')}){auth_suffix}",
             "AUTH",
         )
         return user
+
+    def validate_lesson_access(
+        self,
+        session: requests.Session,
+        lesson_id: str | int | None,
+    ) -> dict[str, Any]:
+        if lesson_id in (None, "", [], {}):
+            raise AnalysisError("缺少 lessonId，无法校验 lesson 级权限")
+
+        url = f"{self.base_url}/api/v3/lesson/basic-info"
+        old_cookies = self._cookie_signature(session)
+        response = session.get(
+            url,
+            params={"lessonId": str(lesson_id)},
+            timeout=15,
+        )
+        auth_changed = self._update_auth_from_response(session, response)
+        self._sync_csrftoken_header(session)
+        if auth_changed or old_cookies != self._cookie_signature(session):
+            self.save_session_state(session, existing_state=self.read_state(silent=True))
+
+        if response.status_code == 401:
+            token, _ = self._normalize_auth(session.headers.get("Authorization"))
+            hint = "缺少桌面端 Authorization 或登录流程未最终完成" if not token else "当前登录态没有该课堂权限或会话已失效"
+            raise AnalysisError(f"lesson/basic-info 返回 401，{hint}")
+
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            snippet = response.text[:240].replace("\n", " ")
+            raise AnalysisError(f"lesson/basic-info 返回非 JSON: {snippet}")
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise AnalysisError(f"lesson/basic-info JSON 解析失败: {exc}") from exc
+        if not isinstance(body, dict):
+            raise AnalysisError("lesson/basic-info 返回了非对象 JSON")
+        if body.get("code") != 0:
+            message = body.get("msg") or body.get("message") or f"code={body.get('code')}"
+            raise AnalysisError(f"lesson/basic-info 校验失败: {message}")
+        self.log(f"lesson 级接口校验通过: lessonId={lesson_id}", "AUTH")
+        return body.get("data") or {}
 
     def keep_alive_session(self) -> dict[str, Any]:
         session = self.load_session()
@@ -856,6 +955,8 @@ class RainClassroomAnalyzer:
         self.log("→ 请求头:", "REQ")
         for key, value in merged_headers.items():
             value_text = str(value)
+            if key.lower() == "authorization":
+                value_text = self._mask_secret(value_text)
             if len(value_text) > 220:
                 value_text = value_text[:220] + "..."
             self.log(f"    {key}: {value_text}", "REQ")
@@ -903,9 +1004,12 @@ class RainClassroomAnalyzer:
         self.log("← 响应头:", "RESP")
         for key, value in response.headers.items():
             preview = value if len(value) <= 320 else value[:320] + "..."
+            if key.lower() in {"authorization", "set-auth"}:
+                preview = self._mask_secret(preview)
             self.log(f"    {key}: {preview}", "RESP")
             if key.lower() in {"set-cookie", "set-auth", "location", "x-request-id"}:
-                self.log(f"    ★ 重要头: {key} = {value}", "KEY")
+                important_value = self._mask_secret(value) if key.lower() == "set-auth" else value
+                self.log(f"    ★ 重要头: {key} = {important_value}", "KEY")
 
         content_type = response.headers.get("Content-Type", "")
         body: dict[str, Any] | None = None
@@ -1177,9 +1281,13 @@ class RainClassroomAnalyzer:
 
         self.log_separator("课堂探测")
         self.active_context = self.fetch_active_context(session)
+        lesson_id = self.active_context.get("lesson_id")
+        if lesson_id not in (None, "", [], {}):
+            self.log_separator("会话权限校验")
+            self.validate_lesson_access(session, lesson_id)
 
         params = self.deep_analyze_url(url)
-        workflow(self, session, url, params, self.active_context.get("lesson_id"))
+        workflow(self, session, url, params, lesson_id)
 
         self.log_separator("分析完成")
         self.log(f"详细报告已保存到: {self.report_file}")
