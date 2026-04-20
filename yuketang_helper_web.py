@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
+import atexit
 import argparse
 import asyncio
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from io import BytesIO
 
 import qrcode
 import requests
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 try:
     from playwright.async_api import async_playwright
@@ -55,6 +62,7 @@ BASE_URL = f"https://{BASE_DOMAIN}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session_web.json")
 DESKTOP_STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
+RUNTIME_LOCK_FILE = os.path.join(SCRIPT_DIR, ".yuketang_runtime_web.lock")
 BROWSER_SYNC_WAIT_SECONDS = 6
 
 
@@ -76,8 +84,22 @@ def read_json_file(path, default):
 
 
 def write_json_file(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def load_state_dict(path=STATE_FILE):
@@ -101,6 +123,87 @@ def normalize_cookie_record(cookie):
         "expires": expires,
         "secure": bool(cookie.get("secure", False)),
     }
+
+
+class RuntimeFileLock:
+    def __init__(self, path):
+        self.path = path
+        self._file = None
+
+    def _read_owner(self):
+        if not self._file:
+            return {}
+        try:
+            self._file.seek(0)
+            raw = self._file.read().strip()
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def owner_text(self):
+        data = self._read_owner()
+        if not data:
+            return ""
+        parts = []
+        pid = data.get("pid")
+        if pid:
+            parts.append(f"PID {pid}")
+        started_at = data.get("started_at")
+        if started_at:
+            parts.append(f"启动于 {started_at}")
+        argv = data.get("argv")
+        if isinstance(argv, list) and argv:
+            parts.append("命令: " + " ".join(str(item) for item in argv))
+        return "，".join(parts)
+
+    def acquire(self):
+        if fcntl is None:
+            return True
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._file = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        self._file.seek(0)
+        self._file.truncate()
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "argv": sys.argv,
+            },
+            self._file,
+            ensure_ascii=False,
+        )
+        self._file.flush()
+        return True
+
+    def release(self):
+        if not self._file:
+            return
+        try:
+            if fcntl is not None:
+                self._file.seek(0)
+                self._file.truncate()
+                self._file.flush()
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+def acquire_runtime_lock():
+    lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
+    if lock.acquire():
+        atexit.register(lock.release)
+        return lock
+    owner = lock.owner_text()
+    suffix = f"（{owner}）" if owner else ""
+    log(f"[!] 检测到同目录已有另一个 Web 实例正在运行{suffix}，为避免覆盖登录态，本次退出")
+    lock.release()
+    return None
 
 
 def persist_cookie_records(cookies):
@@ -430,6 +533,14 @@ class YuketangHelper:
             )
         return cookies
 
+    @staticmethod
+    def _is_authenticated_basic_info(data):
+        if not isinstance(data, dict):
+            return False
+        if data.get("code") == 0:
+            return True
+        return bool(data.get("success"))
+
     def _set_cookie_records(self, cookies, clear=False):
         if clear:
             self.session.cookies.clear()
@@ -464,21 +575,37 @@ class YuketangHelper:
 
     def _probe_session(self):
         if not self.session.cookies.get("sessionid"):
-            return False
-        try:
-            self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
-            self._refresh_session_fields()
-            resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
-            if "application/json" not in resp.headers.get("Content-Type", ""):
-                return False
-            data = resp.json()
-            if isinstance(data, dict) and (data.get("code") == 0 or data.get("success")):
+            return "invalid"
+        original_cookies = self._cookie_records_from_jar()
+        last_network_error = None
+        for attempt in range(3):
+            try:
+                self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
                 self._refresh_session_fields()
-                self.save_session()
-                return True
-        except Exception:
-            return False
-        return False
+                resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
+                if "application/json" not in resp.headers.get("Content-Type", ""):
+                    self._set_cookie_records(original_cookies, clear=True)
+                    return "invalid"
+                data = resp.json()
+                if self._is_authenticated_basic_info(data):
+                    self._refresh_session_fields()
+                    self.save_session()
+                    return "valid"
+                self._set_cookie_records(original_cookies, clear=True)
+                return "invalid"
+            except requests.RequestException as e:
+                last_network_error = e
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+            except Exception:
+                self._set_cookie_records(original_cookies, clear=True)
+                return "invalid"
+        self._set_cookie_records(original_cookies, clear=True)
+        if last_network_error is not None:
+            log(f"[!] Web 登录态探测网络异常: {last_network_error}")
+            return "network_error"
+        return "invalid"
 
     def _cookies_for_playwright(self):
         result = []
@@ -555,8 +682,12 @@ class YuketangHelper:
             return False
         self._set_cookie_records(cookies, clear=True)
         persist_browser_state(storage_state)
-        if self._probe_session():
+        probe_result = self._probe_session()
+        if probe_result == "valid":
             log("[+] 已同步浏览器登录态")
+            return True
+        if probe_result == "network_error":
+            log("[!] 浏览器态已同步，但网络异常，先沿用当前 Cookie")
             return True
         return False
 
@@ -574,8 +705,12 @@ class YuketangHelper:
             return False
         self._set_cookie_records(cookies, clear=True)
         persist_browser_state(storage_state)
-        if self._probe_session():
+        probe_result = self._probe_session()
+        if probe_result == "valid":
             log("[+] 已从浏览器登录态恢复会话")
+            return True
+        if probe_result == "network_error":
+            log("[!] 已恢复 Cookie，但网络异常，先沿用当前会话")
             return True
         return False
 
@@ -583,12 +718,21 @@ class YuketangHelper:
         self._refresh_session_fields()
         persist_cookie_records(self._cookie_records_from_jar())
 
-    def load_session(self):
+    def load_session(self, verify_online=True):
         try:
-            if self._load_cookies_from_state() and self._probe_session():
-                if HAS_PLAYWRIGHT and not load_browser_state():
-                    self._bootstrap_browser_state()
-                return True
+            if self._load_cookies_from_state():
+                if not verify_online:
+                    return bool(self.session.cookies.get("sessionid"))
+                probe_result = self._probe_session()
+                if probe_result == "valid":
+                    if HAS_PLAYWRIGHT and not load_browser_state():
+                        self._bootstrap_browser_state()
+                    return True
+                if probe_result == "network_error":
+                    log("[!] Web 登录态在线校验失败（网络异常），先沿用本地 Cookie")
+                    return True
+            if not verify_online:
+                return False
             return self._rehydrate_session_from_browser_state()
         except Exception:
             return False
@@ -727,7 +871,6 @@ class YuketangHelper:
             self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
             data = self.session.get(f"{BASE_URL}/api/v3/classroom/on-lesson-upcoming-exam").json()
             active = data.get("data", {}).get("onLessonClassrooms", [])
-            self.save_session()
             if not active:
                 self._last_active_lesson_state = "idle"
                 return None, None
@@ -773,18 +916,42 @@ class YuketangHelper:
             return False
 
     def keep_alive(self):
-        try:
-            self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
-            self._refresh_session_fields()
-            self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
-            resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
-            if resp.json().get("code") == 0:
-                log("[+] 会话保活成功")
-                self.save_session()
-                return True
-            return False
-        except Exception:
-            return False
+        original_cookies = self._cookie_records_from_jar()
+        last_network_error = None
+        for attempt in range(3):
+            try:
+                self.session.get(f"{BASE_URL}/v2/web/index", timeout=10)
+                self._refresh_session_fields()
+                self.session.headers.update({"X-CSRFToken": self.csrftoken, "User-Agent": GLOBAL_UA})
+                resp = self.session.get(f"{BASE_URL}/api/v3/user/basic-info", timeout=10)
+                if "application/json" not in resp.headers.get("Content-Type", ""):
+                    snippet = resp.text[:120].replace("\n", " ")
+                    log(f"[-] Web 会话保活失败: 接口返回非 JSON ({snippet})")
+                    self._set_cookie_records(original_cookies, clear=True)
+                    return False
+                data = resp.json()
+                if self._is_authenticated_basic_info(data):
+                    log("[+] Web 会话保活成功")
+                    self.save_session()
+                    return True
+                log(f"[-] Web 会话保活失败: {data.get('msg')}")
+                self._set_cookie_records(original_cookies, clear=True)
+                return False
+            except requests.RequestException as e:
+                last_network_error = e
+                if attempt < 2:
+                    log(f"[!] Web 会话保活网络异常，第 {attempt + 1} 次重试: {e}")
+                    time.sleep(1 + attempt)
+                    continue
+                break
+            except Exception as e:
+                log(f"[!] Web 会话保活异常: {e}")
+                self._set_cookie_records(original_cookies, clear=True)
+                return False
+        self._set_cookie_records(original_cookies, clear=True)
+        if last_network_error is not None:
+            log(f"[!] Web 会话保活网络异常: {last_network_error}")
+        return False
 
 
 def run_until_success(helper, delay_minutes=0, return_to_menu=False):
@@ -827,6 +994,20 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
         return 0 if return_to_menu else 130
 
 
+def ensure_login(helper, allow_interactive_login):
+    auth = helper.load_session()
+    if auth:
+        return True
+    if not allow_interactive_login:
+        log("[!] 当前没有可用 Web 登录态，且本次环境不适合交互扫码登录")
+        return False
+    log("[*] 进入二维码扫码登录...")
+    state, uuid = helper.get_login_qrcode()
+    if not state:
+        return False
+    return helper.wait_for_login_and_callback(state, uuid)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）", add_help=False)
     parser.add_argument("-h", action="help", help="show this help message and exit")
@@ -846,38 +1027,36 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
-    phone = args.phone or AUTO_LOGIN_PHONE
-    password = args.password or AUTO_LOGIN_PSWD
-
-    helper = YuketangHelper()
-    auth = helper.load_session()
-
-    if not auth and not args.qr:
-        if HAS_AUTO_LOGIN:
-            auth = helper.auto_login(phone, password)
-            if auth:
-                auth = helper.load_session()
-        else:
-            log("[*] 未检测到自动登录依赖 (ddddocr/playwright)，跳过自动登录")
-
-    if not auth:
-        log("[*] 进入二维码扫码登录...")
-        state, uuid = helper.get_login_qrcode()
-        if state and helper.wait_for_login_and_callback(state, uuid):
-            auth = True
-
-    if not auth:
-        log("[!] 所有登录方式均失败，请检查网络或账号配置")
+    runtime_lock = acquire_runtime_lock()
+    if runtime_lock is None:
         sys.exit(1)
+    helper = YuketangHelper()
+    interactive_login_allowed = sys.stdin.isatty() and sys.stdout.isatty()
 
     if args.keepalive:
+        if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+            sys.exit(1)
         sys.exit(0 if helper.keep_alive() else 1)
 
+    if args.qr:
+        if not interactive_login_allowed:
+            log("[!] 当前环境不适合交互扫码登录")
+            sys.exit(1)
+        state, uuid = helper.get_login_qrcode()
+        sys.exit(0 if state and helper.wait_for_login_and_callback(state, uuid) else 1)
+
     if args.auto:
+        if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+            sys.exit(1)
         sys.exit(run_until_success(helper, delay_minutes=0))
 
     if args.schedule is not None:
+        if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+            sys.exit(1)
         sys.exit(run_until_success(helper, delay_minutes=max(0, int(args.schedule))))
+
+    if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+        sys.exit(1)
 
     while True:
         print("\n1. 自动扫描签到\n2. 扫码登录\n3. 定时签到\n4. 退出")
@@ -886,6 +1065,8 @@ if __name__ == "__main__":
         except (KeyboardInterrupt, EOFError):
             sys.exit(0)
         if choice == "1":
+            if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+                continue
             run_until_success(helper, delay_minutes=0, return_to_menu=True)
         elif choice == "2":
             state, uuid = helper.get_login_qrcode()
@@ -895,6 +1076,8 @@ if __name__ == "__main__":
             try:
                 delay = int(input("请输入延迟分钟数 (0 = 立即开始): ").strip())
             except (ValueError, KeyboardInterrupt, EOFError):
+                continue
+            if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
                 continue
             run_until_success(helper, delay_minutes=max(0, delay), return_to_menu=True)
         elif choice == "4":

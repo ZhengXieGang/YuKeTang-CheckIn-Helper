@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
+import atexit
 import argparse
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 
 import qrcode
 import requests
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 # ========== 用户配置 ==========
 BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
@@ -34,12 +41,14 @@ GLOBAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 BASE_URL = f"https://{BASE_DOMAIN}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, "yuketang_session.json")
+RUNTIME_LOCK_FILE = os.path.join(SCRIPT_DIR, ".yuketang_runtime.lock")
 DESKTOP_HEADERS = {
     "xtbz": "ykt",
     "desktop-v": "v2",
     "X-Client": "desktop",
     "Origin": "file://",
 }
+SESSION_COOKIE_NAMES = ("sessionid", "sid", "csrftoken")
 
 
 def log(msg):
@@ -60,8 +69,22 @@ def read_json_file(path, default):
 
 
 def write_json_file(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def load_state_dict():
@@ -85,6 +108,87 @@ def normalize_cookie_record(cookie):
         "expires": expires,
         "secure": bool(cookie.get("secure", False)),
     }
+
+
+class RuntimeFileLock:
+    def __init__(self, path):
+        self.path = path
+        self._file = None
+
+    def _read_owner(self):
+        if not self._file:
+            return {}
+        try:
+            self._file.seek(0)
+            raw = self._file.read().strip()
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def owner_text(self):
+        data = self._read_owner()
+        if not data:
+            return ""
+        parts = []
+        pid = data.get("pid")
+        if pid:
+            parts.append(f"PID {pid}")
+        started_at = data.get("started_at")
+        if started_at:
+            parts.append(f"启动于 {started_at}")
+        argv = data.get("argv")
+        if isinstance(argv, list) and argv:
+            parts.append("命令: " + " ".join(str(item) for item in argv))
+        return "，".join(parts)
+
+    def acquire(self):
+        if fcntl is None:
+            return True
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._file = open(self.path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        self._file.seek(0)
+        self._file.truncate()
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "argv": sys.argv,
+            },
+            self._file,
+            ensure_ascii=False,
+        )
+        self._file.flush()
+        return True
+
+    def release(self):
+        if not self._file:
+            return
+        try:
+            if fcntl is not None:
+                self._file.seek(0)
+                self._file.truncate()
+                self._file.flush()
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+def acquire_runtime_lock():
+    lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
+    if lock.acquire():
+        atexit.register(lock.release)
+        return lock
+    owner = lock.owner_text()
+    suffix = f"（{owner}）" if owner else ""
+    log(f"[!] 检测到同目录已有另一个实例正在运行{suffix}，为避免覆盖登录态，本次退出")
+    lock.release()
+    return None
 
 
 class YuketangHelper:
@@ -123,22 +227,126 @@ class YuketangHelper:
     def _save_state(self, state):
         write_json_file(STATE_FILE, state)
 
+    @staticmethod
+    def _coerce_cookie_expiry(value):
+        if value in (None, "", 0, "0"):
+            return None
+        try:
+            expiry = float(value)
+        except Exception:
+            return None
+        if expiry > 10_000_000_000:
+            expiry /= 1000
+        if expiry <= 0:
+            return None
+        return int(expiry)
 
+    @staticmethod
+    def _normalize_cookie_domain(value):
+        return str(value or "").strip().lstrip(".")
+
+    def _cookie_matches_base_domain(self, domain):
+        cookie_domain = self._normalize_cookie_domain(domain)
+        base_domain = self._normalize_cookie_domain(BASE_DOMAIN)
+        if not cookie_domain or not base_domain:
+            return True
+        return (
+            cookie_domain == base_domain
+            or cookie_domain.endswith(f".{base_domain}")
+            or base_domain.endswith(f".{cookie_domain}")
+        )
+
+    def _cookie_sort_key(self, cookie):
+        domain = self._normalize_cookie_domain(cookie.get("domain"))
+        path = str(cookie.get("path") or "/")
+        return (
+            1 if domain == self._normalize_cookie_domain(BASE_DOMAIN) else 0,
+            1 if path == "/" else 0,
+            1 if bool(cookie.get("secure")) else 0,
+            1 if cookie.get("expires") else 0,
+        )
+
+    def _prune_cookie_records(self, cookie_records):
+        kept = {}
+        for item in cookie_records:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            value = item.get("value")
+            if name not in SESSION_COOKIE_NAMES or value is None:
+                continue
+            if not self._cookie_matches_base_domain(item.get("domain")):
+                continue
+            normalized = {
+                "name": name,
+                "value": str(value),
+                "domain": self._normalize_cookie_domain(item.get("domain")) or BASE_DOMAIN,
+                "path": str(item.get("path") or "/"),
+                "expires": self._coerce_cookie_expiry(
+                    item.get("expires", item.get("expirationDate", item.get("expiry")))
+                ),
+                "secure": bool(item.get("secure", False)),
+            }
+            existing = kept.get(name)
+            if existing is None or self._cookie_sort_key(normalized) >= self._cookie_sort_key(existing):
+                kept[name] = normalized
+        order = {name: index for index, name in enumerate(SESSION_COOKIE_NAMES)}
+        return sorted(kept.values(), key=lambda item: order.get(item["name"], 99))
+
+    def _normalize_auth(self, auth_value):
+        raw = (auth_value or "").strip()
+        if not raw:
+            return "", ""
+        if raw.lower().startswith("bearer "):
+            token = raw[7:].strip()
+            return token, (f"Bearer {token}" if token else "")
+        return raw, f"Bearer {raw}"
+
+    def _set_desktop_auth(self, auth_value):
+        token, header = self._normalize_auth(auth_value)
+        if header:
+            self.session.headers["Authorization"] = header
+        else:
+            self.session.headers.pop("Authorization", None)
+        return bool(token)
+
+    def _try_extract_auth_from_response(self, resp):
+        if resp is None:
+            return False
+        old_header = self.session.headers.get("Authorization") or ""
+        candidates = [resp, *(getattr(resp, "history", []) or [])]
+        for item in candidates:
+            headers = getattr(item, "headers", {}) or {}
+            for key in ("set-auth", "Set-Auth", "authorization", "Authorization"):
+                value = headers.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                self._set_desktop_auth(value)
+                new_header = self.session.headers.get("Authorization") or ""
+                return new_header != old_header
+        return False
+
+    def _sync_csrf_header(self):
+        csrftoken = self.session.cookies.get("csrftoken")
+        if csrftoken:
+            self.session.headers["X-CSRFToken"] = csrftoken
+        else:
+            self.session.headers.pop("X-CSRFToken", None)
 
     def _cookie_records_from_jar(self):
         records = []
         for cookie in self.session.cookies:
             records.append(
                 {
-                    "name": cookie.name,
+                    "name": str(cookie.name).lower(),
                     "value": cookie.value,
-                    "domain": cookie.domain or BASE_DOMAIN,
+                    "domain": self._normalize_cookie_domain(cookie.domain or BASE_DOMAIN),
                     "path": cookie.path or "/",
-                    "expires": int(cookie.expires) if cookie.expires else None,
+                    "expires": self._coerce_cookie_expiry(cookie.expires),
                     "secure": bool(cookie.secure),
                 }
             )
-        return records
+        return self._prune_cookie_records(records)
 
     def _set_cookie_records(self, cookies, clear=False):
         if clear:
@@ -147,10 +355,15 @@ class YuketangHelper:
             item = normalize_cookie_record(cookie)
             if not item:
                 continue
-            kwargs = {"domain": item["domain"], "path": item["path"]}
+            kwargs = {
+                "domain": self._normalize_cookie_domain(item["domain"]) or BASE_DOMAIN,
+                "path": item["path"],
+                "secure": bool(item.get("secure", False)),
+            }
             if item["expires"]:
                 kwargs["expires"] = item["expires"]
-            self.session.cookies.set(item["name"], item["value"], **kwargs)
+            self.session.cookies.set(str(item["name"]).lower(), item["value"], **kwargs)
+        self._sync_csrf_header()
 
     def _cookie_signature(self):
         return tuple(
@@ -169,19 +382,14 @@ class YuketangHelper:
 
     def _get_cookie_map(self):
         result = {}
-        for cookie in self.session.cookies:
-            result[cookie.name] = {
-                "name": cookie.name,
-                "value": cookie.value,
-                "domain": cookie.domain or BASE_DOMAIN,
-                "path": cookie.path or "/",
-                "expires": int(cookie.expires) if cookie.expires else None,
-                "secure": bool(cookie.secure),
-            }
+        for cookie in self._cookie_records_from_jar():
+            result[cookie["name"]] = cookie
         return result
 
     def _describe_login_state(self):
         cookie_map = self._get_cookie_map()
+        token, _ = self._normalize_auth(self.session.headers.get("Authorization"))
+        auth_text = "，Authorization 已加载" if token else ""
         for name in ("sid", "sessionid"):
             cookie = cookie_map.get(name)
             if not cookie:
@@ -192,79 +400,180 @@ class YuketangHelper:
                 if expires
                 else "session"
             )
-            return f"{name} 有效至 {expires_text}"
+            return f"{name} 有效至 {expires_text}{auth_text}"
+        if token:
+            return "Authorization 已加载"
         return "无可用登录态"
 
     def save_session(self):
         state = self._load_state()
         if not isinstance(state, dict):
             state = {}
-        for legacy_key in ("cookies", "browser_state", "sessionid", "csrftoken",
-                          "desktop_auth", "desktop_auth_updated_at"):
+        for legacy_key in ("cookies", "browser_state", "sessionid", "csrftoken"):
             state.pop(legacy_key, None)
+        state["base_domain"] = BASE_DOMAIN
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        token, _ = self._normalize_auth(self.session.headers.get("Authorization"))
+        if token:
+            state["desktop_auth"] = token
+            state["desktop_auth_updated_at"] = now_text
+        else:
+            state.pop("desktop_auth", None)
+            state.pop("desktop_auth_updated_at", None)
         cookie_records = self._cookie_records_from_jar()
         if cookie_records:
-            # 只有 jar 中有 Cookie 时才更新，防止意外清空
             state["desktop_cookies"] = cookie_records
-            state["desktop_cookies_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # 如果 jar 为空，保留文件中原有的 Cookie 数据不动
+            state["desktop_cookies_updated_at"] = now_text
+        else:
+            state.pop("desktop_cookies", None)
+            state.pop("desktop_cookies_updated_at", None)
         self._save_state(state)
 
-    def _desktop_request(self, method, path, timeout=20, headers=None, **kwargs):
+    def _desktop_request(
+        self,
+        method,
+        path,
+        timeout=20,
+        headers=None,
+        use_auth="auto",
+        persist_state_on_change=False,
+        **kwargs,
+    ):
+        old_auth = self.session.headers.get("Authorization") or ""
         old_cookie_signature = self._cookie_signature()
         req_headers = {
             "User-Agent": GLOBAL_UA,
             "Content-Type": "application/json",
             **DESKTOP_HEADERS,
         }
+        auth_header = self.session.headers.get("Authorization")
+        if use_auth == "auto":
+            should_send_auth = bool(auth_header)
+        else:
+            should_send_auth = bool(auth_header) and bool(use_auth)
+        if should_send_auth:
+            req_headers["Authorization"] = auth_header
+        elif auth_header:
+            req_headers["Authorization"] = None
         if headers:
             req_headers.update(headers)
         url = path if path.startswith("http") else f"{BASE_URL}{path}"
         resp = self.session.request(method, url, headers=req_headers, timeout=timeout, **kwargs)
-        if self._cookie_signature() != old_cookie_signature:
+        auth_changed = self._try_extract_auth_from_response(resp)
+        self._sync_csrf_header()
+        current_auth = self.session.headers.get("Authorization") or ""
+        cookie_changed = self._cookie_signature() != old_cookie_signature
+        if persist_state_on_change and (auth_changed or current_auth != old_auth or cookie_changed):
             self.save_session()
         return resp
 
     def _probe_login_state(self):
-        try:
-            resp = self._desktop_request("get", "/api/v3/user/basic-info", timeout=10)
-            if "application/json" not in resp.headers.get("Content-Type", ""):
+        original_cookies = self._cookie_records_from_jar()
+        original_auth = self.session.headers.get("Authorization")
+        last_network_error = None
+        for attempt in range(3):
+            try:
+                resp = self._desktop_request(
+                    "get",
+                    "/api/v3/user/basic-info",
+                    timeout=10,
+                    persist_state_on_change=False,
+                )
+                if "application/json" not in resp.headers.get("Content-Type", ""):
+                    self._set_cookie_records(original_cookies, clear=True)
+                    self._set_desktop_auth(original_auth)
+                    return None
+                data = resp.json()
+                if self._is_authenticated_basic_info(data):
+                    self.save_session()
+                    token, _ = self._normalize_auth(self.session.headers.get("Authorization"))
+                    if token:
+                        return "token"
+                    if self.session.cookies:
+                        return "cookie"
+                self._set_cookie_records(original_cookies, clear=True)
+                self._set_desktop_auth(original_auth)
                 return None
-            data = resp.json()
-            if data.get("code") == 0:
-                self.save_session()
-                return "cookie"
-        except Exception:
-            return None
+            except requests.RequestException as e:
+                last_network_error = e
+                if attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+            except Exception:
+                self._set_cookie_records(original_cookies, clear=True)
+                self._set_desktop_auth(original_auth)
+                return None
+        self._set_cookie_records(original_cookies, clear=True)
+        self._set_desktop_auth(original_auth)
+        if last_network_error is not None:
+            log(f"[!] 登录态探测网络异常: {last_network_error}")
+            return "network_error"
         return None
 
+    @staticmethod
+    def _is_authenticated_basic_info(data):
+        if not isinstance(data, dict) or data.get("code") != 0:
+            return False
+        payload = data.get("data")
+        if not isinstance(payload, dict) or not payload:
+            return False
+        for key in ("user_id", "id", "userId", "username", "name"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                if value.strip():
+                    return True
+            elif value:
+                return True
+        return bool(payload)
+
     def _bootstrap_login_state_after_login(self):
-        probe_paths = [
-            "/api/v3/user/basic-info",
-            "/api/v3/classroom/on-lesson-upcoming-exam",
-        ]
+        probe_paths = ["/api/v3/user/basic-info"]
         for path in probe_paths:
             try:
                 resp = self._desktop_request("get", path, timeout=10)
                 if "application/json" not in resp.headers.get("Content-Type", ""):
                     continue
                 data = resp.json()
-                if data.get("code") == 0:
+                if self._is_authenticated_basic_info(data):
                     self.save_session()
-                    return "cookie"
+                    token, _ = self._normalize_auth(self.session.headers.get("Authorization"))
+                    if token:
+                        return "token"
+                    if self.session.cookies:
+                        return "cookie"
             except Exception:
                 continue
         return None
 
-    def load_session(self):
+    def _try_finalize_login_success(self, attempts=1, delay_seconds=1):
+        attempts = max(1, int(attempts or 1))
+        delay_seconds = max(0, float(delay_seconds or 0))
+        for attempt in range(attempts):
+            mode = self._probe_login_state() or self._bootstrap_login_state_after_login()
+            if mode in ("cookie", "token"):
+                log(f"[+] 桌面端登录成功，{self._describe_login_state()}")
+                return True
+            if attempt < attempts - 1 and delay_seconds > 0:
+                time.sleep(delay_seconds)
+        return False
+
+    def load_session(self, verify_online=True):
         try:
             state = self._load_state()
+            self._set_desktop_auth(state.get("desktop_auth"))
             self._set_cookie_records(state.get("desktop_cookies", []), clear=True)
-            if not self.session.cookies:
+            token, _ = self._normalize_auth(self.session.headers.get("Authorization"))
+            if not self.session.cookies and not token:
                 return False
+            if not verify_online:
+                return True
             mode = self._probe_login_state()
-            if mode == "cookie":
-                log(f"[+] Cookie 加载成功，{self._describe_login_state()}")
+            if mode in ("cookie", "token"):
+                label = "Authorization" if mode == "token" else "Cookie"
+                log(f"[+] {label} 加载成功，{self._describe_login_state()}")
+                return True
+            if mode == "network_error":
+                log(f"[!] 登录态在线校验失败（网络异常），先沿用本地会话：{self._describe_login_state()}")
                 return True
             log("[-] 桌面端登录态已失效")
             return False
@@ -358,16 +667,66 @@ class YuketangHelper:
         log("[*] 等待手机端扫码并确认...")
         start = time.time()
         last_status = None
+        wait_for_scan_enabled = True
+        interactive_input = sys.stdin.isatty() and sys.stdout.isatty()
+        handled_verify_tokens = set()
         while True:
             if max_wait and time.time() - start > max_wait:
                 log("[-] 等待登录超时，请重新获取二维码")
                 return False
+            if wait_for_scan_enabled:
+                try:
+                    wait_resp = self._desktop_request(
+                        "post",
+                        "/api/v3/user/login/wait-for-scan",
+                        json={"token": login_token},
+                        timeout=(8, 20),
+                        use_auth=False,
+                        persist_state_on_change=False,
+                    )
+                    wait_data = wait_resp.json()
+                    verify_token = self._extract_verify_code_token(wait_data)
+                    if verify_token:
+                        if verify_token not in handled_verify_tokens:
+                            if not self._handle_verify_code_challenge(verify_token, interactive_input):
+                                return False
+                            handled_verify_tokens.add(verify_token)
+                            if self._try_finalize_login_success(attempts=2, delay_seconds=1):
+                                return True
+                            last_status = "验证码已提交，等待登录完成"
+                            time.sleep(1)
+                            continue
+                        if self._try_finalize_login_success(attempts=1, delay_seconds=0):
+                            return True
+                        time.sleep(1)
+                    wait_code = wait_data.get("code")
+                    wait_msg = wait_data.get("msg") or wait_data.get("message")
+                    if wait_code in (500, 50000, 50001):
+                        log(f"[-] 二维码已失效: {wait_msg or wait_code}")
+                        return False
+                    if wait_msg and wait_msg != last_status:
+                        log(f"[*] 扫码状态: {wait_msg}")
+                        last_status = wait_msg
+                except requests.ReadTimeout:
+                    pass
+                except KeyboardInterrupt:
+                    return False
+                except requests.RequestException as e:
+                    message = f"wait-for-scan 网络异常，稍后重试: {e}"
+                    if message != last_status:
+                        log(f"[!] {message}")
+                        last_status = message
+                except Exception as e:
+                    wait_for_scan_enabled = False
+                    log(f"[!] wait-for-scan 不可用，改用 login 轮询: {e}")
             try:
                 resp = self._desktop_request(
                     "post",
                     "/api/v3/user/login",
                     json={"token": login_token},
                     timeout=(10, 35),
+                    use_auth=False,
+                    persist_state_on_change=False,
                 )
             except requests.ReadTimeout:
                 continue
@@ -385,12 +744,24 @@ class YuketangHelper:
                 time.sleep(2)
                 continue
 
+            verify_token = self._extract_verify_code_token(data)
+            if verify_token:
+                if verify_token not in handled_verify_tokens:
+                    if not self._handle_verify_code_challenge(verify_token, interactive_input):
+                        return False
+                    handled_verify_tokens.add(verify_token)
+                    if self._try_finalize_login_success(attempts=2, delay_seconds=1):
+                        return True
+                    last_status = "验证码已提交，等待登录完成"
+                elif self._try_finalize_login_success(attempts=1, delay_seconds=0):
+                    return True
+                time.sleep(1)
+                continue
+
             code = data.get("code")
             msg = data.get("msg") or data.get("message") or f"code={code}"
             if code == 0:
-                mode = self._probe_login_state() or self._bootstrap_login_state_after_login()
-                if mode == "cookie":
-                    log(f"[+] 桌面端登录成功，{self._describe_login_state()}")
+                if self._try_finalize_login_success(attempts=2, delay_seconds=1):
                     return True
                 header_keys = ", ".join(sorted(resp.headers.keys()))
                 log(
@@ -407,6 +778,88 @@ class YuketangHelper:
                 log(f"[*] 登录状态: {msg}")
                 last_status = msg
             time.sleep(2)
+
+    @staticmethod
+    def _extract_verify_code_token(data):
+        if not isinstance(data, dict):
+            return ""
+        direct_token = str(data.get("token") or "").strip()
+        if direct_token:
+            return direct_token
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("token", "verify_token", "verifyToken", "need_code_token", "needCodeToken"):
+            token = str(payload.get(key) or "").strip()
+            if token:
+                return token
+        return ""
+
+    def _prompt_verify_code(self):
+        while True:
+            try:
+                verify_code = input("请输入手机上显示的 4 位验证码: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return None
+            if len(verify_code) == 4 and verify_code.isdigit():
+                return verify_code
+            log("[-] 验证码格式错误，请输入 4 位数字")
+
+    def _handle_verify_code_challenge(self, verify_token, interactive_input):
+        token = str(verify_token or "").strip()
+        if not token:
+            return False
+        log("[*] 检测到需要输入验证码")
+        if not interactive_input:
+            log("[!] 当前环境无法交互输入验证码，请在交互终端中执行扫码登录")
+            return False
+
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            verify_code = self._prompt_verify_code()
+            if not verify_code:
+                return False
+            if self._submit_login_with_code(token, verify_code):
+                log("[*] 验证码校验通过，等待登录态完成...")
+                return True
+            if attempt < attempts:
+                log("[-] 验证码校验失败，请重新输入")
+        return False
+
+    def _submit_login_with_code(self, need_code_token, verify_code):
+        token = str(need_code_token or "").strip()
+        code = str(verify_code or "").strip()
+        if len(code) != 4 or not code.isdigit() or not token:
+            log("[-] 验证码登录参数无效")
+            return False
+
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self._desktop_request(
+                    "post",
+                    "/api/v3/user/login/login-with-code",
+                    json={"token": token, "code": code},
+                    timeout=(8, 20),
+                    use_auth=False,
+                    persist_state_on_change=False,
+                )
+                data = resp.json()
+                if data.get("code") == 0:
+                    log("[+] 验证码提交成功")
+                    return True
+                log(f"[-] 验证码登录失败: {data.get('msg')}")
+                return False
+            except requests.RequestException as e:
+                if attempt >= attempts:
+                    log(f"[!] 验证码登录网络异常: {e}")
+                    return False
+                log(f"[!] 验证码登录网络异常，第 {attempt} 次重试: {e}")
+                time.sleep(min(2.0, 0.5 * attempt))
+            except Exception as e:
+                log(f"[!] 验证码登录异常: {e}")
+                return False
+        return False
 
     def _fetch_active_lesson_result(self):
         try:
@@ -535,18 +988,49 @@ class YuketangHelper:
         return sign_result
 
     def keep_alive(self):
-        try:
-            resp = self._desktop_request("get", "/api/v3/user/basic-info", timeout=10)
-            data = resp.json()
-            if data.get("code") == 0:
-                log(f"[+] 会话保活成功，{self._describe_login_state()}")
-                self.save_session()
-                return True
-            log(f"[-] 会话保活失败: {data.get('msg')}")
-            return False
-        except Exception as e:
-            log(f"[!] 会话保活异常: {e}")
-            return False
+        original_cookies = self._cookie_records_from_jar()
+        original_auth = self.session.headers.get("Authorization")
+        last_network_error = None
+        for attempt in range(3):
+            try:
+                resp = self._desktop_request(
+                    "get",
+                    "/api/v3/user/basic-info",
+                    timeout=10,
+                    persist_state_on_change=False,
+                )
+                if "application/json" not in resp.headers.get("Content-Type", ""):
+                    snippet = resp.text[:120].replace("\n", " ")
+                    log(f"[-] 会话保活失败: 接口返回非 JSON ({snippet})")
+                    self._set_cookie_records(original_cookies, clear=True)
+                    self._set_desktop_auth(original_auth)
+                    return False
+                data = resp.json()
+                if data.get("code") == 0:
+                    log(f"[+] 会话保活成功，{self._describe_login_state()}")
+                    self.save_session()
+                    return True
+                log(f"[-] 会话保活失败: {data.get('msg')}")
+                self._set_cookie_records(original_cookies, clear=True)
+                self._set_desktop_auth(original_auth)
+                return False
+            except requests.RequestException as e:
+                last_network_error = e
+                if attempt < 2:
+                    log(f"[!] 会话保活网络异常，第 {attempt + 1} 次重试: {e}")
+                    time.sleep(1 + attempt)
+                    continue
+                break
+            except Exception as e:
+                log(f"[!] 会话保活异常: {e}")
+                self._set_cookie_records(original_cookies, clear=True)
+                self._set_desktop_auth(original_auth)
+                return False
+        self._set_cookie_records(original_cookies, clear=True)
+        self._set_desktop_auth(original_auth)
+        if last_network_error is not None:
+            log(f"[!] 会话保活网络异常: {last_network_error}")
+        return False
 def ensure_login(helper, allow_interactive_login):
     auth = helper.load_session()
     if auth:
@@ -617,9 +1101,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
+    runtime_lock = acquire_runtime_lock()
+    if runtime_lock is None:
+        sys.exit(1)
 
     helper = YuketangHelper()
     interactive_login_allowed = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if args.keepalive:
+        if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+            sys.exit(1)
+        sys.exit(0 if helper.keep_alive() else 1)
 
     if args.qr:
         if not interactive_login_allowed:
@@ -628,18 +1120,21 @@ if __name__ == "__main__":
         login_token, _ = helper.get_login_qrcode()
         sys.exit(0 if login_token and helper.wait_for_login_and_callback(login_token) else 1)
 
-    auth = ensure_login(helper, allow_interactive_login=interactive_login_allowed)
-    if not auth:
-        sys.exit(1)
-
-    if args.keepalive:
-        sys.exit(0 if helper.keep_alive() else 1)
-
     if args.auto:
+        auth = ensure_login(helper, allow_interactive_login=interactive_login_allowed)
+        if not auth:
+            sys.exit(1)
         sys.exit(run_until_success(helper, delay_minutes=0))
 
     if args.schedule is not None:
+        auth = ensure_login(helper, allow_interactive_login=interactive_login_allowed)
+        if not auth:
+            sys.exit(1)
         sys.exit(run_until_success(helper, delay_minutes=max(0, int(args.schedule))))
+
+    # 直接运行脚本时先检查登录态；Cookie 失效则自动进入扫码登录
+    if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+        sys.exit(1)
 
     while True:
         print("\n1. 自动扫描签到\n2. 重新扫码登录\n3. 定时签到\n4. 会话保活\n5. 退出")
@@ -649,6 +1144,8 @@ if __name__ == "__main__":
             sys.exit(0)
 
         if choice == "1":
+            if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+                continue
             run_until_success(helper, delay_minutes=0, return_to_menu=True)
         elif choice == "2":
             login_token, _ = helper.get_login_qrcode()
@@ -659,8 +1156,12 @@ if __name__ == "__main__":
                 delay = int(input("请输入延迟分钟数 (0 = 立即开始): ").strip())
             except (ValueError, KeyboardInterrupt, EOFError):
                 continue
+            if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+                continue
             run_until_success(helper, delay_minutes=max(0, delay), return_to_menu=True)
         elif choice == "4":
+            if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):
+                continue
             helper.keep_alive()
         elif choice == "5":
             sys.exit(0)

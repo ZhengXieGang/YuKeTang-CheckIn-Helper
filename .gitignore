@@ -6,6 +6,8 @@
 !yuketang_helper.py
 !yuketang_helper_web.py
 !test_checkin_bypass.py
+#!test_yuketang_helper.py
+#!test_yuketang_helper_web.py
 !yktmobile-0.0.2-debug.apk
 
 # 保留 .gitignore 自身
