@@ -22,7 +22,6 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 默认长江雨课堂，自行更换
 CHECKIN_COOLDOWN_MINUTES = 15           # 签到冷却时长 （分钟）
 SCHEDULE_INTERVAL_SECONDS = 20          # 持续检测间隔（秒）
 SCHEDULE_TIMEOUT_MINUTES = 30           # 首轮超时时间（分钟）
-SCHEDULE_EXTENSION_MINUTES = 15         # 每次超时后追加等待时间（分钟）
 THROTTLED_LOG_INTERVAL_SECONDS = 300    # 同类重复日志节流窗口（秒）
 
 PUSHPLUS_TOKEN = ""                     # 留空则关闭推送
@@ -1047,7 +1046,6 @@ def ensure_login(helper, allow_interactive_login):
 def run_until_success(helper, delay_minutes=0, return_to_menu=False):
     interval_seconds = max(5, int(SCHEDULE_INTERVAL_SECONDS))
     timeout_minutes = max(1, int(SCHEDULE_TIMEOUT_MINUTES))
-    extension_minutes = max(0, int(SCHEDULE_EXTENSION_MINUTES))
 
     if delay_minutes > 0:
         log(f"[*] 将在 {delay_minutes} 分钟后开始持续签到...")
@@ -1056,7 +1054,7 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
     deadline = datetime.now() + timedelta(minutes=timeout_minutes)
     log(
         f"[*] 已启动持续签到（间隔 {interval_seconds} 秒，"
-        f"首轮超时 {timeout_minutes} 分钟，每次超时追加 {extension_minutes} 分钟）"
+        f"窗口期 {timeout_minutes} 分钟）"
     )
     try:
         while True:
@@ -1076,8 +1074,8 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
                 )
 
             if datetime.now() >= deadline:
-                deadline = datetime.now() + timedelta(minutes=extension_minutes)
-                log(f"[*] 已到超时点，自动追加 {extension_minutes} 分钟继续等待...")
+                log(f"[-] 已到签到窗口期上限（{timeout_minutes} 分钟），仍未签到成功，退出")
+                return 1
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         log("[*] 已停止持续签到")
