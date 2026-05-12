@@ -43,6 +43,9 @@ python yuketang_helper.py -s 5
 
 # 会话保活
 python yuketang_helper.py -k
+
+# 停止后台签到任务
+python yuketang_helper.py -c
 ```
 
 ### 动态码签到测试
@@ -80,6 +83,7 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 | 参数 | 说明 |
 |------|------|
 | `-a` / `-auto` | 持续扫描课堂并签到，直到成功 |
+| `-c` | 停止当前后台运行的签到任务 |
 | `-k` / `-keepalive` | 仅执行会话保活 |
 | `-qr` | 强制重新显示桌面端登录二维码 |
 | `-cooldown N` | 签到去重冷却时间（分钟，默认 15） |

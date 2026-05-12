@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -113,6 +114,7 @@ class RuntimeFileLock:
     def __init__(self, path):
         self.path = path
         self._file = None
+        self._locked = False
 
     def _read_owner(self):
         if not self._file:
@@ -125,8 +127,12 @@ class RuntimeFileLock:
         except Exception:
             return {}
 
-    def owner_text(self):
+    def owner_data(self):
         data = self._read_owner()
+        return data if isinstance(data, dict) else {}
+
+    def owner_text(self):
+        data = self.owner_data()
         if not data:
             return ""
         parts = []
@@ -150,6 +156,7 @@ class RuntimeFileLock:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
+        self._locked = True
         self._file.seek(0)
         self._file.truncate()
         json.dump(
@@ -168,7 +175,7 @@ class RuntimeFileLock:
         if not self._file:
             return
         try:
-            if fcntl is not None:
+            if fcntl is not None and self._locked:
                 self._file.seek(0)
                 self._file.truncate()
                 self._file.flush()
@@ -176,17 +183,169 @@ class RuntimeFileLock:
         finally:
             self._file.close()
             self._file = None
+            self._locked = False
 
 
-def acquire_runtime_lock():
+def install_signal_handlers():
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is None:
+        return
+
+    def handle_sigterm(signum, frame):
+        log("[*] 收到停止信号，正在退出当前任务")
+        raise SystemExit(0)
+
+    signal.signal(sigterm, handle_sigterm)
+
+
+def runtime_mode_from_argv(argv):
+    argv = [str(item) for item in (argv or [])]
+    if any(item in ("-a", "-auto") for item in argv):
+        return "持续签到任务"
+    if any(item in ("-s", "-schedule") for item in argv):
+        return "定时签到任务"
+    if any(item in ("-k", "-keepalive") for item in argv):
+        return "会话保活任务"
+    if any(item == "-qr" for item in argv):
+        return "扫码登录任务"
+    return "脚本任务"
+
+
+def is_signin_task_argv(argv):
+    argv = [str(item) for item in (argv or [])]
+    return any(item in ("-a", "-auto", "-s", "-schedule") for item in argv)
+
+
+def pid_exists(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_running_runtime_owner():
+    lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
+    if lock.acquire():
+        lock.release()
+        return None
+    owner = lock.owner_data()
+    lock.release()
+    return owner if owner else {}
+
+
+def stop_runtime_owner(owner, signin_only=False, announce=True):
+    owner = owner if isinstance(owner, dict) else {}
+    if not owner:
+        if announce:
+            if signin_only:
+                log("[*] 当前没有后台签到任务在运行")
+            else:
+                log("[*] 当前没有后台任务在运行")
+        return True
+
+    argv = owner.get("argv") if isinstance(owner.get("argv"), list) else []
+    mode_text = runtime_mode_from_argv(argv)
+    pid = owner.get("pid")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        pid = None
+
+    if signin_only and not is_signin_task_argv(argv):
+        if announce:
+            log(f"[*] 当前运行中的不是签到任务（{mode_text}），无需停止")
+        return True
+
+    if pid == os.getpid():
+        if announce:
+            log("[*] 当前实例就是目标任务，无需停止")
+        return True
+
+    owner_suffix = []
+    if pid:
+        owner_suffix.append(f"PID {pid}")
+    started_at = owner.get("started_at")
+    if started_at:
+        owner_suffix.append(f"启动于 {started_at}")
+    suffix = f"（{'，'.join(owner_suffix)}）" if owner_suffix else ""
+
+    if announce:
+        log(f"[*] 检测到后台{mode_text}正在运行{suffix}，准备停止")
+
+    if not pid:
+        log("[!] 无法确定后台任务 PID，停止失败")
+        return False
+
+    if not pid_exists(pid):
+        log(f"[*] 后台任务 PID {pid} 已不存在，视为已停止")
+        return True
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        log(f"[!] 停止后台任务失败: {e}")
+        return False
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if not pid_exists(pid):
+            log(f"[+] 后台任务已停止（PID {pid}）")
+            return True
+        time.sleep(0.2)
+
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is not None:
+        log(f"[!] 后台任务未及时退出，尝试强制停止（PID {pid}）")
+        try:
+            os.kill(pid, sigkill)
+        except OSError as e:
+            log(f"[!] 强制停止后台任务失败: {e}")
+            return False
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if not pid_exists(pid):
+                log(f"[+] 后台任务已强制停止（PID {pid}）")
+                return True
+            time.sleep(0.2)
+
+    log(f"[!] 后台任务仍在运行（PID {pid}），本次停止失败")
+    return False
+
+
+def stop_background_signin_tasks():
+    owner = read_running_runtime_owner()
+    return stop_runtime_owner(owner, signin_only=True, announce=True)
+
+
+def acquire_runtime_lock(stop_conflict=False):
     lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
     if lock.acquire():
         atexit.register(lock.release)
         return lock
+    owner_data = lock.owner_data()
     owner = lock.owner_text()
     suffix = f"（{owner}）" if owner else ""
-    log(f"[!] 检测到同目录已有另一个实例正在运行{suffix}，为避免覆盖登录态，本次退出")
     lock.release()
+    if stop_conflict:
+        log(f"[*] 检测到同目录已有另一个实例正在运行{suffix}，先停止旧任务再继续")
+        if stop_runtime_owner(owner_data, signin_only=False, announce=False):
+            for _ in range(40):
+                retry_lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
+                if retry_lock.acquire():
+                    atexit.register(retry_lock.release)
+                    return retry_lock
+                retry_lock.release()
+                time.sleep(0.2)
+        log("[!] 停止旧任务后仍无法获取运行锁，本次退出")
+        return None
+    log(f"[!] 检测到同目录已有另一个实例正在运行{suffix}，为避免覆盖登录态，本次退出")
     return None
 
 
@@ -1086,6 +1245,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（桌面端登录版）", add_help=False)
     parser.add_argument("-h", action="help", help="show this help message and exit")
     parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
+    parser.add_argument("-c", dest="clear", action="store_true", help="停止当前后台运行的签到任务")
     parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("-qr", dest="qr", action="store_true", help="显示桌面端登录二维码")
     parser.add_argument(
@@ -1099,7 +1259,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
-    runtime_lock = acquire_runtime_lock()
+    install_signal_handlers()
+
+    if args.clear:
+        sys.exit(0 if stop_background_signin_tasks() else 1)
+
+    should_takeover_conflict = bool(args.auto)
+    runtime_lock = acquire_runtime_lock(stop_conflict=should_takeover_conflict)
     if runtime_lock is None:
         sys.exit(1)
 
