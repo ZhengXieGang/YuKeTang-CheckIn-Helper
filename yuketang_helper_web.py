@@ -1057,6 +1057,29 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
         return 0 if return_to_menu else 130
 
 
+def run_once(helper, allow_interactive_login=False):
+    if not ensure_login(helper, allow_interactive_login=allow_interactive_login):
+        log("[-] 一次扫描签到结果：登录态不可用，需要重新扫码登录")
+        return 3
+
+    lesson_id, classroom_id = helper.get_active_lesson_data()
+    if not lesson_id:
+        if helper._last_active_lesson_state == "error":
+            log("[-] 一次扫描签到结果：获取课堂列表失败")
+            return 1
+        log("[*] 一次扫描签到结果：当前没有正在进行的课堂")
+        return 2
+
+    lesson_info = helper._lesson_info_for(lesson_id)
+    if helper.sign_in(lesson_id, classroom_id=classroom_id, lesson_info=lesson_info):
+        lesson_display = helper._lesson_display(lesson_id, lesson_info)
+        log(f"[+] 一次扫描签到结果：签到成功 (课堂: {lesson_display}, 编号: {lesson_id})")
+        return 0
+    lesson_display = helper._lesson_display(lesson_id, lesson_info)
+    log(f"[-] 一次扫描签到结果：课堂 {lesson_display} 本次未签到成功")
+    return 1
+
+
 def ensure_login(helper, allow_interactive_login):
     auth = helper.load_session()
     if auth:
@@ -1075,6 +1098,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）", add_help=False)
     parser.add_argument("-h", action="help", help="show this help message and exit")
     parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
+    parser.add_argument("-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
     parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("-qr", dest="qr", action="store_true", help="强制使用二维码扫码登录")
     parser.add_argument("-p", "-phone", dest="phone", type=str, help="手机号（覆盖脚本内置配置）")
@@ -1107,6 +1131,9 @@ if __name__ == "__main__":
             sys.exit(1)
         state, uuid = helper.get_login_qrcode()
         sys.exit(0 if state and helper.wait_for_login_and_callback(state, uuid) else 1)
+
+    if args.once:
+        sys.exit(run_once(helper, allow_interactive_login=interactive_login_allowed))
 
     if args.auto:
         if not ensure_login(helper, allow_interactive_login=interactive_login_allowed):

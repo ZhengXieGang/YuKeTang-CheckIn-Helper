@@ -1315,11 +1315,33 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
         return 0 if return_to_menu else 130
 
 
+def run_once(helper, allow_interactive_login=False):
+    if not ensure_login(helper, allow_interactive_login=allow_interactive_login):
+        log("[-] 一次扫描签到结果：登录态不可用，需要重新扫码登录")
+        return 3
+
+    result = helper.auto_sign_once(emit_log=True)
+    state = result.get("state")
+    message = result.get("message") or "未知结果"
+    if state == "success":
+        log(f"[+] 一次扫描签到结果：{message}")
+        return 0
+    if state == "idle":
+        log("[*] 一次扫描签到结果：当前没有正在进行的课堂")
+        return 2
+    if state == "cooldown":
+        log(f"[*] 一次扫描签到结果：{message}")
+        return 0
+    log(f"[-] 一次扫描签到结果：{message}")
+    return 1
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（桌面端登录版）", add_help=False)
     parser.add_argument("-h", action="help", help="show this help message and exit")
     parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
     parser.add_argument("-c", dest="clear", action="store_true", help="停止当前后台运行的签到任务")
+    parser.add_argument("-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
     parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("-qr", dest="qr", action="store_true", help="显示桌面端登录二维码")
     parser.add_argument(
@@ -1357,6 +1379,9 @@ if __name__ == "__main__":
             sys.exit(1)
         login_token, _ = helper.get_login_qrcode()
         sys.exit(0 if login_token and helper.wait_for_login_and_callback(login_token) else 1)
+
+    if args.once:
+        sys.exit(run_once(helper, allow_interactive_login=interactive_login_allowed))
 
     if args.auto:
         auth = ensure_login(helper, allow_interactive_login=interactive_login_allowed)
