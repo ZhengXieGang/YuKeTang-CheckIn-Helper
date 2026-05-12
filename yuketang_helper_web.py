@@ -47,11 +47,12 @@ THROTTLED_LOG_INTERVAL_SECONDS = 300  # 同类重复日志节流窗口（秒）
 PUSHPLUS_TOKEN = ""  # 留空则关闭推送
 PUSHPLUS_CHANNEL = "wechat"  # wechat / mail / webhook / cp / sms
 PUSHPLUS_TEMPLATE = "txt"
-PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_id}"
+PUSHPLUS_TITLE_TEMPLATE = "雨课堂签到成功 - {lesson_name}"
 PUSHPLUS_CONTENT_TEMPLATE = (
     "签到成功\n"
     "模式：{backend}\n"
-    "课堂：{lesson_id}\n"
+    "课堂：{lesson_name}\n"
+    "课堂号：{lesson_id}\n"
     "时间：{success_time}"
 )
 # ==============================
@@ -478,6 +479,7 @@ class YuketangHelper:
         self.csrftoken = None
         self._throttled_logs = {}
         self._last_active_lesson_state = "unknown"
+        self._last_active_lesson_info = {}
 
     def _normalize_log_key(self, value):
         return re.sub(r"0x[0-9a-fA-F]+", "0x*", str(value)).strip()
@@ -539,6 +541,46 @@ class YuketangHelper:
         if data.get("code") == 0:
             return True
         return bool(data.get("success"))
+
+    @staticmethod
+    def _extract_lesson_info(classroom):
+        classroom = classroom if isinstance(classroom, dict) else {}
+        lesson_id = classroom.get("lessonId")
+        classroom_id = classroom.get("classroomId")
+        lesson_name = (
+            classroom.get("courseName")
+            or classroom.get("lessonName")
+            or classroom.get("classroomName")
+            or classroom.get("name")
+            or classroom.get("title")
+            or ""
+        )
+        classroom_name = classroom.get("classroomName") or ""
+        return {
+            "lesson_id": str(lesson_id or "").strip(),
+            "classroom_id": str(classroom_id or "").strip(),
+            "lesson_name": str(lesson_name or "").strip(),
+            "classroom_name": str(classroom_name or "").strip(),
+        }
+
+    @staticmethod
+    def _lesson_display(lesson_id, lesson_info=None):
+        info = lesson_info if isinstance(lesson_info, dict) else {}
+        name = str(info.get("lesson_name") or "").strip()
+        classroom_name = str(info.get("classroom_name") or "").strip()
+        if name and classroom_name and classroom_name != name:
+            return f"{name} / {classroom_name}"
+        if name:
+            return name
+        return str(lesson_id)
+
+    def _lesson_info_for(self, lesson_id, lesson_info=None):
+        if isinstance(lesson_info, dict) and lesson_info:
+            return lesson_info
+        last_info = self._last_active_lesson_info
+        if isinstance(last_info, dict) and str(last_info.get("lesson_id") or "") == str(lesson_id):
+            return last_info
+        return {}
 
     def _set_cookie_records(self, cookies, clear=False):
         if clear:
@@ -736,7 +778,7 @@ class YuketangHelper:
         except Exception:
             return False
 
-    def _check_cooldown(self, lesson_id):
+    def _check_cooldown(self, lesson_id, lesson_info=None):
         state = self._load_state()
         last = state.get("last_checkin") if isinstance(state, dict) else None
         if not last or str(last.get("lesson_id")) != str(lesson_id):
@@ -746,31 +788,41 @@ class YuketangHelper:
                 datetime.now() - datetime.strptime(last["time"], "%Y-%m-%d %H:%M:%S")
             ).total_seconds() / 60
             if elapsed < CHECKIN_COOLDOWN_MINUTES:
-                log(f"[*] 课堂 {lesson_id} 在 {int(elapsed)} 分钟前已签到，跳过")
+                display_info = lesson_info if isinstance(lesson_info, dict) and lesson_info else last
+                lesson_display = self._lesson_display(lesson_id, display_info)
+                log(f"[*] 课堂 {lesson_display} 在 {int(elapsed)} 分钟前已签到，跳过")
                 return True
         except Exception:
             pass
         return False
 
-    def _record_checkin(self, lesson_id):
+    def _record_checkin(self, lesson_id, lesson_info=None):
         state = self._load_state()
         if not isinstance(state, dict):
             state = {}
+        info = lesson_info if isinstance(lesson_info, dict) else {}
         state["last_checkin"] = {
             "lesson_id": str(lesson_id),
+            "lesson_name": str(info.get("lesson_name") or "").strip(),
+            "classroom_id": str(info.get("classroom_id") or "").strip(),
+            "classroom_name": str(info.get("classroom_name") or "").strip(),
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._save_state(state)
 
-    def _pushplus_notify_success(self, lesson_id):
+    def _pushplus_notify_success(self, lesson_id, lesson_info=None):
         token = str(PUSHPLUS_TOKEN).strip()
         if not token:
             return
 
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        info = lesson_info if isinstance(lesson_info, dict) else {}
         context = {
             "backend": "web",
             "lesson_id": str(lesson_id),
+            "lesson_name": self._lesson_display(lesson_id, info),
+            "classroom_id": str(info.get("classroom_id") or ""),
+            "classroom_name": str(info.get("classroom_name") or ""),
             "success_time": now_text,
         }
         title = PUSHPLUS_TITLE_TEMPLATE.format_map(SafeFormatDict(context))
@@ -872,18 +924,26 @@ class YuketangHelper:
             active = data.get("data", {}).get("onLessonClassrooms", [])
             if not active:
                 self._last_active_lesson_state = "idle"
+                self._last_active_lesson_info = {}
                 return None, None
             self._last_active_lesson_state = "active"
-            return active[0].get("lessonId"), active[0].get("classroomId")
+            lesson_info = self._extract_lesson_info(active[0])
+            self._last_active_lesson_info = lesson_info
+            return (
+                lesson_info["lesson_id"] or active[0].get("lessonId"),
+                lesson_info["classroom_id"] or active[0].get("classroomId"),
+            )
         except Exception as e:
             message = f"[!] 获取课堂列表异常: {e}"
             log_key = f"active_lesson_error:{self._normalize_log_key(message)}"
             self._last_active_lesson_state = "error"
+            self._last_active_lesson_info = {}
             self._log_throttled(log_key, message)
             return None, None
 
-    def sign_in(self, lesson_id, classroom_id=None, source=1):
-        if self._check_cooldown(lesson_id):
+    def sign_in(self, lesson_id, classroom_id=None, source=1, lesson_info=None):
+        lesson_info = self._lesson_info_for(lesson_id, lesson_info)
+        if self._check_cooldown(lesson_id, lesson_info=lesson_info):
             return False
         self._refresh_session_fields()
         payload = {"lessonId": str(lesson_id), "source": source}
@@ -898,18 +958,21 @@ class YuketangHelper:
         try:
             res = self.session.post(f"{BASE_URL}/api/v3/lesson/checkin", headers=headers, json=payload).json()
             if res.get("code") == 0:
-                log(f"[+] 签到成功 (课堂: {lesson_id})")
-                self._record_checkin(lesson_id)
+                lesson_display = self._lesson_display(lesson_id, lesson_info)
+                log(f"[+] 签到成功 (课堂: {lesson_display}, 编号: {lesson_id})")
+                self._record_checkin(lesson_id, lesson_info=lesson_info)
                 self.save_session()
-                self._pushplus_notify_success(lesson_id)
+                self._pushplus_notify_success(lesson_id, lesson_info=lesson_info)
                 return True
             else:
-                message = f"[-] 签到失败: {res.get('msg')}"
+                lesson_display = self._lesson_display(lesson_id, lesson_info)
+                message = f"[-] 课堂 {lesson_display} 签到失败: {res.get('msg')}"
                 log_key = f"sign_in:{lesson_id}:failed:{self._normalize_log_key(res.get('msg'))}"
                 self._log_throttled(log_key, message)
                 return False
         except Exception as e:
-            message = f"[!] 签到请求异常: {e}"
+            lesson_display = self._lesson_display(lesson_id, lesson_info)
+            message = f"[!] 课堂 {lesson_display} 签到请求异常: {e}"
             log_key = f"sign_in:{lesson_id}:error:{self._normalize_log_key(message)}"
             self._log_throttled(log_key, message)
             return False
@@ -970,12 +1033,14 @@ def run_until_success(helper, delay_minutes=0, return_to_menu=False):
         while True:
             lesson_id, classroom_id = helper.get_active_lesson_data()
             if lesson_id:
-                if helper.sign_in(lesson_id, classroom_id=classroom_id):
+                lesson_info = helper._lesson_info_for(lesson_id)
+                if helper.sign_in(lesson_id, classroom_id=classroom_id, lesson_info=lesson_info):
                     log("[+] 已签到成功，结束持续签到")
                     return 0
+                lesson_display = helper._lesson_display(lesson_id, lesson_info)
                 helper._log_throttled(
                     f"sign_retry_wait:{lesson_id}",
-                    f"[-] 课堂 {lesson_id} 本次未签到成功，继续重试...",
+                    f"[-] 课堂 {lesson_display} 本次未签到成功，继续重试...",
                 )
             elif helper._last_active_lesson_state != "error":
                 helper._log_throttled(
