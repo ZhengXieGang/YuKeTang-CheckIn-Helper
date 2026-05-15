@@ -203,6 +203,8 @@ def runtime_mode_from_argv(argv):
     argv = [str(item) for item in (argv or [])]
     if any(item in ("-a", "-auto") for item in argv):
         return "持续签到任务"
+    if any(item in ("-o", "-once") for item in argv):
+        return "一次扫描签到任务"
     if any(item in ("-s", "-schedule") for item in argv):
         return "定时签到任务"
     if any(item in ("-k", "-keepalive") for item in argv):
@@ -214,7 +216,7 @@ def runtime_mode_from_argv(argv):
 
 def is_signin_task_argv(argv):
     argv = [str(item) for item in (argv or [])]
-    return any(item in ("-a", "-auto", "-s", "-schedule") for item in argv)
+    return any(item in ("-a", "-auto", "-o", "-once", "-s", "-schedule") for item in argv)
 
 
 def pid_exists(pid):
@@ -325,6 +327,21 @@ def stop_background_signin_tasks():
     return stop_runtime_owner(owner, signin_only=True, announce=True)
 
 
+def once_conflict_exit_code():
+    owner = read_running_runtime_owner()
+    if not owner:
+        return None
+
+    argv = owner.get("argv") if isinstance(owner.get("argv"), list) else []
+    mode_text = runtime_mode_from_argv(argv)
+    if is_signin_task_argv(argv):
+        log(f"[*] 一次扫描签到结果：已有后台{mode_text}正在运行，本次不重复执行")
+        return 0
+
+    log(f"[-] 一次扫描签到结果：已有后台{mode_text}正在运行，本次不执行，避免覆盖登录态")
+    return 1
+
+
 def acquire_runtime_lock(stop_conflict=False):
     lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
     if lock.acquire():
@@ -335,12 +352,15 @@ def acquire_runtime_lock(stop_conflict=False):
     suffix = f"（{owner}）" if owner else ""
     lock.release()
     if stop_conflict:
-        log(f"[*] 检测到同目录已有另一个实例正在运行{suffix}，先停止旧任务再继续")
+        argv = owner_data.get("argv") if isinstance(owner_data.get("argv"), list) else []
+        mode_text = runtime_mode_from_argv(argv)
+        log(f"[*] 检测到后台{mode_text}正在运行{suffix}，正在停止并接管")
         if stop_runtime_owner(owner_data, signin_only=False, announce=False):
             for _ in range(40):
                 retry_lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
                 if retry_lock.acquire():
                     atexit.register(retry_lock.release)
+                    log("[+] 已接管后台任务，继续本次签到")
                     return retry_lock
                 retry_lock.release()
                 time.sleep(0.2)
@@ -1341,7 +1361,7 @@ if __name__ == "__main__":
     parser.add_argument("-h", action="help", help="show this help message and exit")
     parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
     parser.add_argument("-c", dest="clear", action="store_true", help="停止当前后台运行的签到任务")
-    parser.add_argument("-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
+    parser.add_argument("-o", "-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
     parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("-qr", dest="qr", action="store_true", help="显示桌面端登录二维码")
     parser.add_argument(
@@ -1359,6 +1379,11 @@ if __name__ == "__main__":
 
     if args.clear:
         sys.exit(0 if stop_background_signin_tasks() else 1)
+
+    if args.once:
+        conflict_code = once_conflict_exit_code()
+        if conflict_code is not None:
+            sys.exit(conflict_code)
 
     should_takeover_conflict = bool(args.auto)
     runtime_lock = acquire_runtime_lock(stop_conflict=should_takeover_conflict)

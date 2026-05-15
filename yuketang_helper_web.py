@@ -129,6 +129,7 @@ class RuntimeFileLock:
     def __init__(self, path):
         self.path = path
         self._file = None
+        self._locked = False
 
     def _read_owner(self):
         if not self._file:
@@ -166,6 +167,7 @@ class RuntimeFileLock:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
+        self._locked = True
         self._file.seek(0)
         self._file.truncate()
         json.dump(
@@ -184,7 +186,7 @@ class RuntimeFileLock:
         if not self._file:
             return
         try:
-            if fcntl is not None:
+            if fcntl is not None and self._locked:
                 self._file.seek(0)
                 self._file.truncate()
                 self._file.flush()
@@ -192,6 +194,17 @@ class RuntimeFileLock:
         finally:
             self._file.close()
             self._file = None
+            self._locked = False
+
+
+def runtime_lock_busy_text():
+    lock = RuntimeFileLock(RUNTIME_LOCK_FILE)
+    if lock.acquire():
+        lock.release()
+        return ""
+    owner = lock.owner_text()
+    lock.release()
+    return owner or "后台 Web 任务"
 
 
 def acquire_runtime_lock():
@@ -1098,7 +1111,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="雨课堂自动签到助手（Web 账密登录版）", add_help=False)
     parser.add_argument("-h", action="help", help="show this help message and exit")
     parser.add_argument("-a", "-auto", dest="auto", action="store_true", help="持续扫描课堂并签到，直到成功")
-    parser.add_argument("-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
+    parser.add_argument("-o", "-once", dest="once", action="store_true", help="只扫描一次当前课堂并签到，无课堂则立即返回")
     parser.add_argument("-k", "-keepalive", dest="keepalive", action="store_true", help="仅执行会话保活")
     parser.add_argument("-qr", dest="qr", action="store_true", help="强制使用二维码扫码登录")
     parser.add_argument("-p", "-phone", dest="phone", type=str, help="手机号（覆盖脚本内置配置）")
@@ -1114,6 +1127,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     CHECKIN_COOLDOWN_MINUTES = args.cooldown
+    if args.once:
+        busy = runtime_lock_busy_text()
+        if busy:
+            log("[*] 一次扫描签到结果：已有后台 Web 任务正在运行，本次不重复执行")
+            sys.exit(0)
+
     runtime_lock = acquire_runtime_lock()
     if runtime_lock is None:
         sys.exit(1)

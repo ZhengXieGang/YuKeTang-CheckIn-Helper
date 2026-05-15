@@ -33,7 +33,7 @@ playwright install chromium
 python yuketang_helper.py -a
 
 # 只扫描一次当前课堂并签到（无课堂立即返回）
-python yuketang_helper.py -once
+python yuketang_helper.py -o
 
 # 强制扫码登录
 python yuketang_helper.py -qr
@@ -86,7 +86,7 @@ BASE_DOMAIN = "changjiang.yuketang.cn"  # 长江雨课堂（默认）
 | 参数 | 说明 |
 |------|------|
 | `-a` / `-auto` | 持续扫描课堂并签到，直到成功 |
-| `-once` | 只扫描一次当前课堂并签到，无课堂则立即返回 |
+| `-o` / `-once` | 只扫描一次当前课堂并签到，无课堂则立即返回；已有后台签到任务时不重复执行 |
 | `-c` | 停止当前后台运行的签到任务 |
 | `-k` / `-keepalive` | 仅执行会话保活 |
 | `-qr` | 强制重新显示桌面端登录二维码 |
