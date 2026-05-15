@@ -12,3 +12,12 @@
 
 # 保留 .gitignore 自身
 !.gitignore
+
+# 私有联动脚本/配置，禁止入库
+*bemfa*
+*xiaomi*
+*miot*
+*homeassistant*
+router_login*
+run_all_login.sh
+*.secret
